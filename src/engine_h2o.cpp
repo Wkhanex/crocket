@@ -103,6 +103,7 @@ struct Session {
   Phase phase = Phase::Body;
   Request meta;  // the request without its body, for early/late rejections
   std::string body;
+  std::size_t body_held = 0;  // counted in Stats::body_bytes (max_body_memory) until the session ends
   bool head_only = false;
   bool discarding = false;  // answered before the body was in: read and drop the rest
   std::size_t discarded = 0;
@@ -224,6 +225,20 @@ class Engine final : public Executor {
   std::vector<std::thread> workers_;
   std::atomic<std::size_t> outstanding_{0};  // dispatched, response not yet delivered
 
+  // --- connection limits ----------------------------------------------------------
+  friend void on_connection_close(void* data);
+  friend void on_ip_connection_close(void* data);
+  /// Counts a new connection, or false at max_connections.
+  bool admit_connection();
+  /// A connection closed: below the limit again, so loops that paused accepting resume.
+  void connection_closed();
+  /// Counts a connection from `ip`, or false at max_connections_per_ip.
+  bool admit_ip(const std::string& ip);
+  void ip_closed(const std::string& ip);
+  std::atomic<unsigned> paused_loops_{0};
+  std::mutex ip_m_;
+  std::unordered_map<std::string, unsigned> per_ip_;  // only with max_connections_per_ip
+
   // Shutdown, in phases the loops and run() take in turn.
   std::optional<std::latch> loops_drained_;
   std::atomic<bool> workers_stopped_{false};
@@ -250,6 +265,11 @@ class Loop final : public Executor {
   [[nodiscard]] int wake_fd() const { return wake_fd_; }
   /// New connections use `fresh` (whose reference this loop takes over).
   void use_tls(SSL_CTX* fresh);
+  /// At max_connections: stop taking connections, so they wait in the kernel's
+  /// queue; resume_accepting() starts again once one has closed.
+  void pause_accepting();
+  void resume_accepting();
+  [[nodiscard]] bool paused() const { return paused_.load(); }
 
   // h2o callbacks (C function pointers into the loop).
   int on_req(h2o_req_t* req);
@@ -321,6 +341,7 @@ class Loop final : public Executor {
   Receiver jobs_rx_{};
   bool drained_ = false;
   bool cleaned_up_ = false;
+  std::atomic<bool> paused_{false};  // not accepting: at max_connections
 
   std::uint64_t next_txn_ = 1;
   std::unordered_map<std::uint64_t, Session*> live_;
@@ -422,6 +443,15 @@ bool Loop::take_body(Session* s, h2o_iovec_t chunk) {
   if (s->body.size() + chunk.len > cfg_.max_body_bytes) {
     reject(s, {413, "body.too_large", "request body too large", {}});
     return false;
+  }
+  if (chunk.len) {
+    auto& held = app_.core().stats.body_bytes;
+    if (held.fetch_add(std::int64_t(chunk.len)) + std::int64_t(chunk.len) > std::int64_t(cfg_.max_body_memory)) {
+      held.fetch_sub(std::int64_t(chunk.len));
+      reject(s, {503, "server.busy", "too many request bodies in memory; try again shortly", {}});
+      return false;
+    }
+    s->body_held += chunk.len;
   }
   s->body.append(chunk.base ? chunk.base : "", chunk.len);
   return true;
@@ -594,19 +624,116 @@ void Loop::respond(Session* s, Response res) {
 
 void Loop::forget(Session* s) {
   s->stop.request_stop();  // the client is gone (or done): cancel blocking extractors
+  if (s->body_held) app_.core().stats.body_bytes.fetch_sub(std::int64_t(s->body_held));
   if (h2o_timer_is_linked(&s->deadline.timer)) h2o_timer_unlink(&s->deadline.timer);
   if (h2o_timer_is_linked(&s->kick.timer)) h2o_timer_unlink(&s->kick.timer);
   if (s->txn) live_.erase(s->txn);
   delete s;
 }
 
+/// What a connection's on_close needs when max_connections_per_ip is on.
+struct IpConnection {
+  Engine* engine;
+  std::string ip;
+};
+
+void on_connection_close(void* data) { static_cast<Engine*>(data)->connection_closed(); }
+
+void on_ip_connection_close(void* data) {
+  auto* c = static_cast<IpConnection*>(data);
+  c->engine->ip_closed(c->ip);
+  c->engine->connection_closed();
+  delete c;
+}
+
+/// The peer's address as 16 bytes (IPv4 as IPv4-mapped IPv6), for per-IP counts.
+std::string peer_key(h2o_socket_t* sock) {
+  sockaddr_storage ss{};
+  if (h2o_socket_getpeername(sock, reinterpret_cast<sockaddr*>(&ss)) == 0) return {};
+  std::string key(16, '\0');
+  if (ss.ss_family == AF_INET6) {
+    std::memcpy(key.data(), &reinterpret_cast<sockaddr_in6*>(&ss)->sin6_addr, 16);
+  } else if (ss.ss_family == AF_INET) {
+    key[10] = key[11] = char(0xff);
+    std::memcpy(key.data() + 12, &reinterpret_cast<sockaddr_in*>(&ss)->sin_addr, 4);
+  }
+  return key;
+}
+
 void Loop::on_accept(h2o_socket_t* listener, const char* err) {
   if (err) return;
   for (int i = 0; i < 64; ++i) {  // take what is queued, a bounded batch per wakeup
+    if (!e_.admit_connection()) {
+      pause_accepting();
+      return;
+    }
     h2o_socket_t* sock = h2o_evloop_socket_accept(listener);
-    if (!sock) return;
+    if (!sock) {
+      e_.connection_closed();
+      return;
+    }
+    if (opts_.max_connections_per_ip) {
+      auto ip = peer_key(sock);
+      if (!e_.admit_ip(ip)) {
+        app_.core().stats.connections_per_ip_closed.fetch_add(1, std::memory_order_relaxed);
+        h2o_socket_close(sock);  // nothing was sent: the client sees the connection close
+        e_.connection_closed();
+        continue;
+      }
+      sock->on_close.cb = on_ip_connection_close;
+      sock->on_close.data = new IpConnection{&e_, std::move(ip)};
+    } else {
+      sock->on_close.cb = on_connection_close;
+      sock->on_close.data = &e_;
+    }
     h2o_accept(&accept_ctx_, sock);
   }
+}
+
+void Loop::pause_accepting() {
+  if (!listener_ || paused_.exchange(true)) return;
+  h2o_socket_read_stop(listener_);
+  e_.paused_loops_.fetch_add(1);
+  // A connection may have closed between the count and the pause: look again.
+  if (app_.core().stats.connections.load() < std::int64_t(opts_.max_connections)) resume_accepting();
+}
+
+void Loop::resume_accepting() {
+  if (!paused_.exchange(false)) return;
+  e_.paused_loops_.fetch_sub(1);
+  if (listener_) h2o_socket_read_start(listener_, on_accept_cb);
+}
+
+bool Engine::admit_connection() {
+  auto& n = app_.core().stats.connections;
+  if (n.fetch_add(1) >= std::int64_t(opts_.max_connections)) {
+    n.fetch_sub(1);
+    return false;
+  }
+  return true;
+}
+
+void Engine::connection_closed() {
+  app_.core().stats.connections.fetch_sub(1);
+  if (paused_loops_.load() == 0) return;
+  for (auto& l : loops_)  // each resumes on its own thread
+    if (l->paused()) l->post([loop = l.get()] { loop->resume_accepting(); });
+}
+
+bool Engine::admit_ip(const std::string& ip) {
+  std::lock_guard lk(ip_m_);
+  auto& n = per_ip_[ip];
+  if (n >= opts_.max_connections_per_ip) {
+    if (n == 0) per_ip_.erase(ip);
+    return false;
+  }
+  ++n;
+  return true;
+}
+
+void Engine::ip_closed(const std::string& ip) {
+  std::lock_guard lk(ip_m_);
+  if (auto it = per_ip_.find(ip); it != per_ip_.end() && --it->second == 0) per_ip_.erase(it);
 }
 
 // ---- workers ----------------------------------------------------------------------------
@@ -845,6 +972,8 @@ int Engine::run() {
   config_.max_request_entity_size = SIZE_MAX;
   // Plain-text HTTP/2 (prior knowledge or Upgrade: h2c) only when asked for.
   config_.http1.upgrade_to_http2 = opts_.h2_prior_knowledge ? 1 : 0;
+  config_.http2.max_streams = std::max(1u, opts_.http2_max_streams);  // advertised in SETTINGS
+  config_.http2.max_concurrent_requests_per_connection = config_.http2.max_streams;
   // After GOAWAY, connections still open when the drain ends are closed.
   config_.http2.graceful_shutdown_timeout = std::uint64_t(std::max<std::int64_t>(1, cfg_.drain_timeout.count()));
   h2o_hostconf_t* host = h2o_config_register_host(&config_, h2o_iovec_init(H2O_STRLIT("default")), 65535);

@@ -696,6 +696,8 @@ Built-in fairings:
   - `crocket_http_requests_total` and a duration histogram.
   - `crocket_http_requests_in_flight`.
   - `crocket_extractor_failures_total`.
+  - `crocket_connections`, `crocket_connections_per_ip_closed_total` and
+    `crocket_request_body_bytes` (see [Limits](#limits)).
   - `crocket_workers`, `crocket_workers_busy` and `crocket_workers_stuck` (still running
     after their request's deadline), and `crocket_requests_abandoned_total`. See
     [Deadlines and cancellation](#deadlines-and-cancellation).
@@ -1038,9 +1040,27 @@ connection it owns. CPUs outside the process's affinity mask (a container's cpus
 on a pool of `LaunchOptions::workers` threads, or on the loops once they have proved fast
 (see [adaptive placement](#adaptive-placement)).
 
-Requests whose headers exceed `LaunchOptions::max_header_bytes` (8 KiB) or
-`max_header_count` (100) get 431 `headers.too_large`. The threading model and the other
-limits are in [docs/ENGINE.md](docs/ENGINE.md).
+#### Limits
+
+Every resource a client can make the server hold has a bound. The defaults follow h2o's
+(for connections and HTTP/2) and Rocket's (for a JSON body):
+
+| Limit | Default | Past it |
+|---|---|---|
+| `LaunchOptions::max_connections` | 1024 | New connections wait in the kernel's accept queue until one closes; they are not refused |
+| `LaunchOptions::max_connections_per_ip` | 0 (none) | A new connection from that address is closed at once. Off by default: behind a load balancer every connection comes from the balancer's address. Set it when clients connect directly |
+| `LaunchOptions::http2_max_streams` | 100 | Concurrent requests on one HTTP/2 connection, as advertised in its SETTINGS |
+| `LaunchOptions::max_header_bytes`, `max_header_count` | 8 KiB, 100 | 431 `headers.too_large` |
+| `Config::max_body_bytes` | 1 MiB | 413 `body.too_large` |
+| `Config::max_body_memory` | 256 MiB | 503 `server.busy`: request bodies held in memory, every request together |
+| `Config::max_in_flight` | 1024 | 503 `server.busy` |
+| `Config::request_timeout` | 30 s | 504 `deadline.exceeded` |
+| Request headers, from h2o | 10 s to arrive, 5 s between reads | The connection is closed |
+| An idle HTTP/2 connection, from h2o | 10 s | Closed with GOAWAY |
+
+`Metrics` reports `crocket_connections`, `crocket_connections_per_ip_closed_total` and
+`crocket_request_body_bytes` (bodies held now). The threading model is in
+[docs/ENGINE.md](docs/ENGINE.md).
 
 ### Behind a proxy
 
@@ -1257,7 +1277,7 @@ corpus and two seconds of mutations, without coverage.
 | `async` | `Task<T>` handlers in-process: suspension and resumption, request context after a resume, the hop back from a foreign library's thread, `callback<T>()` (later, now, twice, abandoned), exceptions after a resume, async gRPC methods, and 200 concurrent sleeping handlers. |
 | `compile_fail.*` | Programs that must not compile. Covers acceptance item 5, where the `{age}` vs `years` diagnostic must name both identifiers, plus other misuses and a control file that must compile. |
 | `consumer` | `tests/consumer`, a small application that adds crocket with FetchContent, builds with only `crocket::crocket` linked (no C++ standard of its own), and serves one request. It also fails if crocket's targets or h2o's options leak into the application's cache. |
-| `tls_h2` | Real sockets, self-signed TLS, ALPN h2 and http/1.1, and the handler suite over both, including custom headers, `X-Request-Id`, CORS preflight, 431 for oversized headers and too many headers, a 304 for a matching `If-None-Match`, security headers, 20 async handlers sharing 2 workers, and a deadline waking a sleeping task, requests queued past their deadline never running their handler, and `crocket_workers_stuck` for handlers that ignore the deadline. Also adaptive placement: a route promoted after 1,000 fast runs, demoted by one slow run, and a `Pool` route that is never promoted. Also h2 bodies larger than the flow-control window, chunked uploads, a 413 that keeps the h1 connection, a handler longer than the h2 idle timeout, TLS certificate reload (a replaced file, a broken one, SIGHUP, a request in flight across it), and graceful drain (acceptance item 7). Needs `openssl` and a curl built with HTTP/2. Uses ports 18443 and 8000. |
+| `tls_h2` | Real sockets, self-signed TLS, ALPN h2 and http/1.1, and the handler suite over both, including custom headers, `X-Request-Id`, CORS preflight, 431 for oversized headers and too many headers, a 304 for a matching `If-None-Match`, security headers, 20 async handlers sharing 2 workers, and a deadline waking a sleeping task, requests queued past their deadline never running their handler, and `crocket_workers_stuck` for handlers that ignore the deadline. Also adaptive placement: a route promoted after 1,000 fast runs, demoted by one slow run, and a `Pool` route that is never promoted. Also h2 bodies larger than the flow-control window, chunked uploads, a 413 that keeps the h1 connection, a handler longer than the h2 idle timeout, TLS certificate reload (a replaced file, a broken one, SIGHUP, a request in flight across it), connection limits (waiting at `max_connections`, closed past `max_connections_per_ip`), `http2_max_streams` in SETTINGS, `max_body_memory`, and graceful drain (acceptance item 7). Needs `openssl` and a curl built with HTTP/2. Uses ports 18443 and 8000. |
 | `grpc` | Protobuf encoding byte for byte, decode errors, unary calls, status mapping, the generated `.proto` and mount validation, in-process. |
 | `openapi` | The OpenAPI document for an API using every parameter, body and return type, checked piece by piece (schemas for every member kind and annotation, variants, recursion, name clashes, every `$ref` resolving), and served by the `OpenApi` fairing with its docs page. |
 | `fuzz.*` | Each [fuzz target](#fuzzing): its corpus, then two seconds of mutations. |
@@ -1277,6 +1297,10 @@ corpus and two seconds of mutations, without coverage.
 | `CROCKET_DEBUG_ROUTES` | unset | Set to any value to expose `GET /__routes` |
 | `CROCKET_WORKERS` | one per core | Handler threads |
 | `CROCKET_EVENT_LOOPS` | one per physical core | Network I/O threads |
+| `CROCKET_MAX_CONNECTIONS` | `1024` | Open connections, all loops together |
+| `CROCKET_MAX_CONNECTIONS_PER_IP` | `0` (none) | Open connections from one address |
+| `CROCKET_HTTP2_MAX_STREAMS` | `100` | Concurrent requests on one HTTP/2 connection |
+| `CROCKET_MAX_BODY_MEMORY` | `268435456` (256 MiB) | Request bodies held in memory at once, in bytes |
 
 ## Differences from REQUIREMENTS.md
 

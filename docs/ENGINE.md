@@ -194,10 +194,23 @@ HTTP/1.1 uploads are decoded by h2o and accepted.
 | More than `max_header_count` request headers (default 100) | 431 `headers.too_large` |
 | `Content-Length` over `max_body_bytes`, or a body that grows past it | 413 `body.too_large` |
 | `max_in_flight` requests already dispatched | 503 `server.busy` |
+| A piece of a body that would take the bodies held by every request past `max_body_memory` | 503 `server.busy` |
 | Deadline (`request_timeout`) reached | 504 `deadline.exceeded` |
 
 All of these go through `Crocket::reject`, so they get a request id, a JSON error body, a
 completion log line and metrics like any other response. The handler never runs.
+
+Connections are limited before any request:
+
+- **`max_connections`:** each accept first counts the connection in a counter shared by
+  every loop. At the limit the loop stops reading its listening socket, as h2o's own
+  server does, so new connections wait in the kernel's accept queue. The listener is
+  level-triggered, so when a connection closes (h2o's `on_close` on its socket), every
+  paused loop is told to start reading again and takes what queued.
+- **`max_connections_per_ip`:** counts per peer address, under a mutex taken only on
+  accept and close. A connection past it is closed before anything is read.
+- **`max_body_memory`:** a shared count of body bytes held, raised as each piece arrives
+  and lowered when the request's session ends.
 
 Requests h2o cannot parse never reach the engine. h2o answers them itself with a plain
 400 (h1: a malformed request line or `Content-Length`, or more than 100 headers or

@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # Ubuntu 26.04 with the ./dev setup packages and GCC 16.2 already built
+    # (docker/toolchain.Dockerfile, published by toolchain.yml).
+    container:
+      image: ghcr.io/sean3z/crocket-toolchain:gcc-16.2
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    timeout-minutes: 60
+    env:
+      CCACHE_DIR: /github/home/.cache/ccache
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: /github/home/.cache/ccache
+          key: ccache-${{ github.sha }}
+          restore-keys: ccache-
+
+      - name: Release build and all tests
+        run: ./dev check

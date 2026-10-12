@@ -1,5 +1,7 @@
 # crocket
 
+[![CI](https://github.com/sean3z/crocket/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sean3z/crocket/actions/workflows/ci.yml)
+
 A C++ web framework in the same spirit as [Rocket](https://rocket.rs) for Rust. Not a port.
 
 Handlers are functions. Path captures and extractors are arguments. The return value is the response. Routes are declared with C++26 annotations and discovered with reflection. The wire layer is [h2o](https://github.com/h2o/h2o) (HTTP/1.1, HTTP/2, TLS).
@@ -17,6 +19,105 @@ crocket::build()
   .mount("/", reflect_routes<^^api>())
   .launch({.host = "0.0.0.0", .port = 8000});
 ```
+
+Routes, typed path parameters, JSON and query binding, OpenAPI and gRPC all come from the same function signatures, checked at compile time. Its parsers are fuzzed ([Fuzzing](#fuzzing)), and conditional and range requests follow RFC 9110 ([Caching and ranges](#caching-and-ranges)).
+
+### Compared with Crow and Drogon
+
+The same route, `GET /hello/{name}/{age}`, in each framework:
+
+<table>
+<tr><th>crocket</th><th>Crow</th><th>Drogon</th></tr>
+<tr><td>
+
+```cpp
+namespace api {
+[[= http::get("/hello/{name}/{age}")]]
+auto hello(std::string_view name,
+           std::uint8_t age) -> std::string {
+  return std::format("Hello, {} year old named {}!",
+                     age, name);
+}
+}
+
+crocket::build()
+  .mount("/", reflect_routes<^^api>())
+  .launch({.port = 8000});
+```
+
+</td><td>
+
+```cpp
+crow::SimpleApp app;
+
+CROW_ROUTE(app, "/hello/<string>/<int>")
+([](std::string name, int age) {
+  return std::format("Hello, {} year old named {}!",
+                     age, name);
+});
+
+app.port(8000).multithreaded().run();
+```
+
+</td><td>
+
+```cpp
+drogon::app().registerHandler(
+  "/hello/{name}/{age}",
+  [](const drogon::HttpRequestPtr&,
+     std::function<void(const drogon::HttpResponsePtr&)>&& cb,
+     const std::string& name, int age) {
+    auto resp = drogon::HttpResponse::newHttpResponse();
+    resp->setBody(std::format(
+      "Hello, {} year old named {}!", age, name));
+    cb(resp);
+  },
+  {drogon::Get});
+
+drogon::app().addListener("0.0.0.0", 8000).run();
+```
+
+</td></tr>
+</table>
+
+In crocket the route is a plain, named function: no macro, no registration call, and no callback. Captures bind to parameters by name, so a typo in `{age}` is a compile error, and `age` out of `std::uint8_t` range is a 404 before the handler runs. Crow matches captures by position through `<int>`/`<string>` in the macro; Drogon by position in the lambda's parameter list.
+
+### Quick start
+
+```bash
+git clone https://github.com/sean3z/crocket && cd crocket
+./dev setup     # apt packages for Ubuntu 26.04 (asks for sudo once)
+./dev gcc       # builds GCC 16.2 into ~/.local/gcc-16.2 (the slow part)
+./dev check     # release build plus the full test suite
+./build/crocket_hello
+curl localhost:8000/hello/Rocketeer/42   # Hello, 42 year old named Rocketeer!
+```
+
+To use crocket in your own project, see [Using crocket](#using-crocket).
+
+## Try it
+
+**Docker, no toolchain needed:**
+
+```sh
+docker run --rm -p 8000:8000 ghcr.io/sean3z/crocket-hello
+curl localhost:8000/hello/Rocketeer/42   # Hello, 42 year old named Rocketeer!
+```
+
+**In your browser:** [annotations plus reflected routes on Compiler Explorer](https://godbolt.org/z/Gdes8Kbdq)
+(GCC 16.2, `-std=c++26 -freflection`; a single-file sketch, [examples/godbolt.cpp](examples/godbolt.cpp), without h2o).
+
+**As a dev container:** `ghcr.io/sean3z/crocket-toolchain:gcc-16.2` is Ubuntu 26.04 with every
+`./dev setup` package and GCC 16.2 already built, the same image CI runs in. Point
+`.devcontainer/devcontainer.json` at it (`{"image": "ghcr.io/sean3z/crocket-toolchain:gcc-16.2"}`),
+or run it by hand:
+
+```sh
+docker run --rm -it -v "$PWD:/src" -p 8000:8000 ghcr.io/sean3z/crocket-toolchain:gcc-16.2 ./dev run hello
+```
+
+(`./dev run` uses the dev profile, which listens on 127.0.0.1; inside a container use
+`./dev check` and run `build/crocket_hello` to listen on 0.0.0.0.)
 
 ## Why reflection?
 
@@ -1187,7 +1288,9 @@ don't need it.
 ./dev check        # release build plus the full ctest, before calling a change done
 ```
 
-`./dev help` lists every command. Builds go to `build-dev/` (Debug), `build/`
+`./dev help` lists every command. CI (`.github/workflows/ci.yml`) runs `./dev setup`,
+`./dev gcc` and `./dev check` in an `ubuntu:26.04` container on every push to `main`
+and every pull request, and caches the GCC build. Builds go to `build-dev/` (Debug), `build/`
 (release) and `build-fuzz/` (see [Fuzzing](#fuzzing)), configured from `CMakePresets.json`. `./dev` picks the compiler in this
 order: `$CROCKET_CXX`, GCC 16.2 in `~/.local/gcc-16.2`, then `g++-16`.
 

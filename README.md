@@ -32,7 +32,8 @@ Most C++ web frameworks bind routes with runtime registration (`app.get("/x", la
 
 The trade-off is toolchain reach and build time. You need a compiler with C++26 reflection (developed on GCC 16), and heavily annotated translation units compile more slowly than hand-registered routes.
 
-See [REQUIREMENTS.md](REQUIREMENTS.md) and [docs/ENGINE.md](docs/ENGINE.md).
+See [docs/DESIGN.md](docs/DESIGN.md) for crocket's goals, non-goals and principles, and
+[docs/ENGINE.md](docs/ENGINE.md) for how the wire engine works.
 
 ## Using crocket
 
@@ -1278,7 +1279,7 @@ corpus and two seconds of mutations, without coverage.
 
 | Test | What it checks |
 |---|---|
-| `acceptance` | The request pipeline in-process via `LocalClient`, with no sockets. Covers acceptance items 1–4 and 6, plus routing, responders, request ids, log lines, application logging (templates, context, redaction, sampling, levels, a full buffer), metrics, health checks, CORS, pools, the dev profile, header validation, trusted proxies, allowed hosts, `Shield`, ETags, 304s and ranges. |
+| `acceptance` | The request pipeline in-process via `LocalClient`, with no sockets. Covers [acceptance criteria](docs/DESIGN.md#acceptance-criteria) 1–4 and 6, plus routing, responders, request ids, log lines, application logging (templates, context, redaction, sampling, levels, a full buffer), metrics, health checks, CORS, pools, the dev profile, header validation, trusted proxies, allowed hosts, `Shield`, ETags, 304s and ranges. |
 | `json` | JSON in-process: round trips, field paths, the 64-bit range and `as_string`, UTF-8 checking and repair, duplicate keys, limits, every annotation, chrono, variants, validation, the regex engine (including inputs that make backtracking engines hang) and problem+json bodies from `Json<T>`. |
 | `cpus` | The default number of event loops: physical cores from CPU topology, counting hyperthread siblings once, honouring the affinity mask, and falling back when topology is missing. |
 | `router` | The route tree against a linear scan of every route, over 2,000 random route tables: the same candidates in the same order, the same captures, HEAD falling back to GET, and the same methods for 405. |
@@ -1309,18 +1310,6 @@ corpus and two seconds of mutations, without coverage.
 | `CROCKET_MAX_CONNECTIONS_PER_IP` | `0` (none) | Open connections from one address |
 | `CROCKET_HTTP2_MAX_STREAMS` | `100` | Concurrent requests on one HTTP/2 connection |
 | `CROCKET_MAX_BODY_MEMORY` | `268435456` (256 MiB) | Request bodies held in memory at once, in bytes |
-
-## Differences from REQUIREMENTS.md
-
-- A missing bearer token is 401 `auth.missing`, and a non-Bearer scheme is 401
-  `auth.invalid`. The requirements list `auth.expired`; the `Authenticator` still
-  returns `auth.expired` for expired tokens.
-- `Json<T>` with a non-JSON `content-type` is 415 `json.unsupported_media_type`.
-  Malformed JSON is 422 `json.invalid` as specified. Validation failures, unknown fields
-  under `deny_unknown_fields`, duplicate keys and exceeded limits have their own codes
-  (see [JSON](#json)).
-- Error bodies are RFC 9457 problem details (`application/problem+json`). `message` is
-  sent as `detail`, and `ApiError::detail` stays in the logs.
 
 ## License
 

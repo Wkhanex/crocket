@@ -144,7 +144,7 @@ Add crocket to a CMake project with FetchContent:
 include(FetchContent)
 FetchContent_Declare(crocket
   GIT_REPOSITORY https://github.com/sean3z/crocket.git
-  GIT_TAG 9f16a91c2e9ea453d8aa4fe0505ad56948a3e030) 
+  GIT_TAG 9f16a91c2e9ea453d8aa4fe0505ad56948a3e030)
 FetchContent_MakeAvailable(crocket)
 
 target_link_libraries(my_app PRIVATE crocket::crocket)

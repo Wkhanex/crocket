@@ -1,0 +1,4 @@
+build
+build-dev
+build-fuzz
+.git

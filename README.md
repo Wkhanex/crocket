@@ -95,6 +95,30 @@ curl localhost:8000/hello/Rocketeer/42   # Hello, 42 year old named Rocketeer!
 
 To use crocket in your own project, see [Using crocket](#using-crocket).
 
+## Try it
+
+**Docker, no toolchain needed:**
+
+```sh
+docker run --rm -p 8000:8000 ghcr.io/sean3z/crocket-hello
+curl localhost:8000/hello/Rocketeer/42   # Hello, 42 year old named Rocketeer!
+```
+
+**In your browser:** [annotations plus reflected routes on Compiler Explorer](https://godbolt.org/z/Gdes8Kbdq)
+(GCC 16.2, `-std=c++26 -freflection`; a single-file sketch, [examples/godbolt.cpp](examples/godbolt.cpp), without h2o).
+
+**As a dev container:** `ghcr.io/sean3z/crocket-toolchain:gcc-16.2` is Ubuntu 26.04 with every
+`./dev setup` package and GCC 16.2 already built, the same image CI runs in. Point
+`.devcontainer/devcontainer.json` at it (`{"image": "ghcr.io/sean3z/crocket-toolchain:gcc-16.2"}`),
+or run it by hand:
+
+```sh
+docker run --rm -it -v "$PWD:/src" -p 8000:8000 ghcr.io/sean3z/crocket-toolchain:gcc-16.2 ./dev run hello
+```
+
+(`./dev run` uses the dev profile, which listens on 127.0.0.1; inside a container use
+`./dev check` and run `build/crocket_hello` to listen on 0.0.0.0.)
+
 ## Why reflection?
 
 Most C++ web frameworks bind routes with runtime registration (`app.get("/x", lambda)`), macros or a code generator. crocket uses C++26 static reflection instead. Routes are ordinary functions: the annotation is a normal C++ value, and `reflect_routes<^^api>()` reads the functions, their annotations and their parameters at compile time. That buys a few things:

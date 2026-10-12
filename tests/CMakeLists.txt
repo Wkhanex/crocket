@@ -1,4 +1,4 @@
-# Acceptance 1-4, 6 and the production behaviour: in-process, no sockets.
+# Acceptance criteria 1-4 and 6 (docs/DESIGN.md) and the production behaviour: in-process, no sockets.
 add_executable(crocket_acceptance acceptance.cpp)
 target_link_libraries(crocket_acceptance PRIVATE crocket)
 add_test(NAME acceptance COMMAND crocket_acceptance)

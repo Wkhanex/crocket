@@ -1,4 +1,4 @@
-// Acceptance tests from REQUIREMENTS.md, run in-process through LocalClient
+// The acceptance criteria of docs/DESIGN.md, run in-process through LocalClient
 // (same pipeline as the network engine, no sockets). Items 5 and 7 live in
 // tests/compile_fail and tests/tls_h2.sh.
 

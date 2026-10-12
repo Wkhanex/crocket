@@ -18,6 +18,81 @@ crocket::build()
   .launch({.host = "0.0.0.0", .port = 8000});
 ```
 
+Routes, typed path parameters, JSON and query binding, OpenAPI and gRPC all come from the same function signatures, checked at compile time. Its parsers are fuzzed ([Fuzzing](#fuzzing)), and conditional and range requests follow RFC 9110 ([Caching and ranges](#caching-and-ranges)).
+
+### Compared with Crow and Drogon
+
+The same route, `GET /hello/{name}/{age}`, in each framework:
+
+<table>
+<tr><th>crocket</th><th>Crow</th><th>Drogon</th></tr>
+<tr><td>
+
+```cpp
+namespace api {
+[[= http::get("/hello/{name}/{age}")]]
+auto hello(std::string_view name,
+           std::uint8_t age) -> std::string {
+  return std::format("Hello, {} year old named {}!",
+                     age, name);
+}
+}
+
+crocket::build()
+  .mount("/", reflect_routes<^^api>())
+  .launch({.port = 8000});
+```
+
+</td><td>
+
+```cpp
+crow::SimpleApp app;
+
+CROW_ROUTE(app, "/hello/<string>/<int>")
+([](std::string name, int age) {
+  return std::format("Hello, {} year old named {}!",
+                     age, name);
+});
+
+app.port(8000).multithreaded().run();
+```
+
+</td><td>
+
+```cpp
+drogon::app().registerHandler(
+  "/hello/{name}/{age}",
+  [](const drogon::HttpRequestPtr&,
+     std::function<void(const drogon::HttpResponsePtr&)>&& cb,
+     const std::string& name, int age) {
+    auto resp = drogon::HttpResponse::newHttpResponse();
+    resp->setBody(std::format(
+      "Hello, {} year old named {}!", age, name));
+    cb(resp);
+  },
+  {drogon::Get});
+
+drogon::app().addListener("0.0.0.0", 8000).run();
+```
+
+</td></tr>
+</table>
+
+In crocket the route is a plain, named function: no macro, no registration call, and no callback. Captures bind to parameters by name, so a typo in `{age}` is a compile error, and `age` out of `std::uint8_t` range is a 404 before the handler runs. Crow matches captures by position through `<int>`/`<string>` in the macro; Drogon by position in the lambda's parameter list.
+
+### Quick start
+
+```bash
+git clone https://github.com/sean3z/crocket && cd crocket
+./dev setup     # apt packages for Ubuntu 26.04 (asks for sudo once)
+./dev gcc       # builds GCC 16.2 into ~/.local/gcc-16.2 (the slow part)
+./dev check     # release build plus the full test suite
+./build/crocket_hello
+curl localhost:8000/hello/Rocketeer/42   # Hello, 42 year old named Rocketeer!
+```
+
+To use crocket in your own project, see [Using crocket](#using-crocket).
+
 ## Why reflection?
 
 Most C++ web frameworks bind routes with runtime registration (`app.get("/x", lambda)`), macros or a code generator. crocket uses C++26 static reflection instead. Routes are ordinary functions: the annotation is a normal C++ value, and `reflect_routes<^^api>()` reads the functions, their annotations and their parameters at compile time. That buys a few things:

@@ -310,6 +310,16 @@ wait_up "http://127.0.0.1:8000/" || fail "hello did not start"
 expect "hello" "Hello, 42 year old named Rocketeer!" "$(curl -s http://127.0.0.1:8000/hello/Rocketeer/42)"
 expect "age 400 -> 404" "404" "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/hello/Rocketeer/400)"
 expect "percent-decoded capture" "Hello, 36 year old named Ada L!" "$(curl -s 'http://127.0.0.1:8000/hello/Ada%20L/36')"
+# The engine routes the raw target as LocalClient does (normalize_path).
+expect "%2F in a capture is data, not a segment" "Hello, 36 year old named a/b!" \
+  "$(curl -s --path-as-is 'http://127.0.0.1:8000/hello/a%2Fb/36')"
+expect "  ... ..%2F too" "Hello, 36 year old named ../x!" "$(curl -s --path-as-is 'http://127.0.0.1:8000/hello/..%2Fx/36')"
+expect "dot segments are removed" "Hello, 36 year old named Bob!" \
+  "$(curl -s --path-as-is 'http://127.0.0.1:8000/hello/Ada/../Bob/36')"
+expect "  ... encoded ones too" "Hello, 36 year old named Ada!" \
+  "$(curl -s --path-as-is 'http://127.0.0.1:8000/x/%2e%2E/hello/Ada/36')"
+expect "a NUL in the path: 400" "400" \
+  "$(curl -s -o /dev/null -w '%{http_code}' --path-as-is 'http://127.0.0.1:8000/hello/a%00b/36')"
 # A 413 sent before the body is read leaves an http/1.1 connection usable: the
 # engine reads and drops the rest of the body. curl closes a connection after an
 # early response itself, so this speaks HTTP/1.1 over a plain socket.

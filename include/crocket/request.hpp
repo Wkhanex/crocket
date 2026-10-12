@@ -8,6 +8,7 @@
 
 #include <array>
 #include <initializer_list>
+#include <memory>
 #include <chrono>
 #include <stop_token>
 #include <string>
@@ -70,6 +71,7 @@ class Captures {
     if (n_ < capacity) items_[n_++] = v;
   }
   void clear() noexcept { n_ = 0; }
+  void set(std::size_t i, std::string_view v) noexcept { items_[i] = v; }
   [[nodiscard]] std::size_t size() const noexcept { return n_; }
   [[nodiscard]] bool empty() const noexcept { return n_ == 0; }
   [[nodiscard]] std::string_view operator[](std::size_t i) const noexcept { return items_[i]; }
@@ -133,6 +135,9 @@ struct Request {
   const RouteDef* route = nullptr;   // the candidate's definition; null while unmatched
   std::string_view handler;         // "api::create"
   Captures captures;
+  /// Captures that held a %2F or %25, decoded ("a%2Fb" -> "a/b"); `captures`
+  /// views into it. Shared, so a copy of the request keeps them valid.
+  std::shared_ptr<std::vector<std::string>> decoded_captures;
 
   [[nodiscard]] std::optional<std::string_view> header(std::string_view name) const {
     return headers.get(name);

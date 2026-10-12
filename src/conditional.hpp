@@ -7,9 +7,10 @@
 namespace crocket::detail {
 
 /// For a 200 to GET or HEAD: adds an ETag (a hash of the body) unless the
-/// handler set one, answers 304 when If-None-Match or If-Modified-Since says
-/// the client's copy is current, and serves one byte range as 206 (or 416)
-/// when the response has `accept-ranges: bytes`.
-void conditional(const Request& rq, Response& rs);
+/// handler set one or the body is larger than `etag_max_bytes`, answers 304
+/// when If-None-Match or If-Modified-Since says the client's copy is current,
+/// and serves one byte range as 206 (or 416) when the response has
+/// `accept-ranges: bytes`.
+void conditional(const Request& rq, Response& rs, std::size_t etag_max_bytes);
 
 }  // namespace crocket::detail

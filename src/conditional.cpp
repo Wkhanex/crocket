@@ -136,9 +136,9 @@ std::optional<std::pair<std::size_t, std::size_t>> parse_range(std::string_view 
 
 }  // namespace
 
-void conditional(const Request& rq, Response& rs) {
+void conditional(const Request& rq, Response& rs, std::size_t etag_max_bytes) {
   if (rs.status != 200 || (rq.method != http::Method::Get && rq.method != http::Method::Head)) return;
-  if (!rs.headers.contains("etag")) {
+  if (!rs.headers.contains("etag") && rs.body.size() <= etag_max_bytes && etag_max_bytes > 0) {
     // "<16 hex digits>", written directly: this runs for every GET.
     static constexpr char hex[] = "0123456789abcdef";
     char tag[18] = {'"'};
@@ -147,7 +147,7 @@ void conditional(const Request& rq, Response& rs) {
     tag[17] = '"';
     rs.headers.add("etag", std::string_view(tag, sizeof tag));
   }
-  std::string etag(*rs.headers.get("etag"));
+  std::string etag(rs.headers.get("etag").value_or(""));  // "": none (a body past etag_max_bytes)
   auto last_modified = rs.headers.get("last-modified");
 
   // If-None-Match decides when present; If-Modified-Since only without it.

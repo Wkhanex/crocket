@@ -181,6 +181,12 @@ Routes& route_table() {
 std::unique_ptr<detail::Router> g_router;
 
 void route(std::string_view in) {
+  // The path requests are routed on: canonical, so normalizing again changes nothing.
+  if (auto p = detail::normalize_path(in)) {
+    if (p->empty() || p->front() != '/') fuzz::fail("a normalized path does not start with '/': " + *p);
+    auto again = detail::normalize_path(*p);
+    if (!again || *again != *p) fuzz::fail("normalizing twice changed the path: " + *p);
+  }
   for (auto m : {http::Method::Get, http::Method::Head, http::Method::Post, http::Method::Put}) {
     auto found = g_router->match(m, in);
     for (const auto* r : found) (void)found.captures(*r);
@@ -299,7 +305,9 @@ void request(std::string_view in) {
   rq.method_text = std::string(method);
   rq.method = http::parse_method(rq.method_text);
   auto q = target.find('?');
-  rq.path = detail::percent_decode(target.substr(0, q), false);
+  auto path = detail::normalize_path(target.substr(0, q));
+  if (!path) return;  // the engine's 400
+  rq.path = std::move(*path);
   if (q != std::string_view::npos) rq.query = detail::parse_query(target.substr(q + 1));
   rq.protocol = "http/1.1";
   rq.peer_addr = "203.0.113.7";

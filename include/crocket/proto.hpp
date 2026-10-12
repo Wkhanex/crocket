@@ -332,6 +332,7 @@ inline bool read_varint(Reader& r, std::uint64_t& v) {
   for (int shift = 0; shift < 64; shift += 7) {
     if (r.empty()) return false;
     std::uint8_t b = *r.p++;
+    if (shift == 63 && b > 1) return false;  // the 10th byte has room for bit 63 only
     v |= std::uint64_t(b & 0x7f) << shift;
     if (!(b & 0x80)) return true;
   }

@@ -120,7 +120,14 @@ auto hello(std::string_view name, std::uint8_t age) -> std::string {
 ```
 
 `/hello/Ada/36` calls `hello`. `/hello/Ada/400` does not, because 400 isn't a
-`uint8_t`. It returns 404 `path.invalid` instead.
+`uint8_t`. It returns 404 `path.invalid` instead. A floating-point capture must be a
+finite number: `nan` and `inf` don't match.
+
+Paths are split on `/` before they are decoded, so a capture can hold any character:
+`/hello/a%2Fb/36` calls `hello` with `name` = `a/b`, and can't be routed as
+`/hello/a/b/36`. Dot segments (`.` and `..`, encoded or not) are removed first, and never
+climb above `/`. A path that decodes to a NUL byte is 400. `LocalClient` routes exactly
+as the server does.
 
 A mismatch between the path and the signature is a **compile error**, not a runtime
 surprise:
@@ -1053,6 +1060,7 @@ Every resource a client can make the server hold has a bound. The defaults follo
 | `LaunchOptions::max_header_bytes`, `max_header_count` | 8 KiB, 100 | 431 `headers.too_large` |
 | `Config::max_body_bytes` | 1 MiB | 413 `body.too_large` |
 | `Config::max_body_memory` | 256 MiB | 503 `server.busy`: request bodies held in memory, every request together |
+| `Config::etag_max_bytes` | 1 MiB | Bodies longer than this get no automatic ETag (hashing is about a microsecond per 10 KiB); set one yourself, or 0 for none |
 | `Config::max_in_flight` | 1024 | 503 `server.busy` |
 | `Config::request_timeout` | 30 s | 504 `deadline.exceeded` |
 | Request headers, from h2o | 10 s to arrive, 5 s between reads | The connection is closed |

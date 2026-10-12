@@ -105,6 +105,11 @@ constexpr std::string parse_template(std::string_view path, std::vector<Segment>
       if (seg.find_first_of("{}") != std::string_view::npos)
         return std::string("segment '") + std::string(seg) +
                "' mixes literal text and a capture; captures must be whole segments";
+      // Request paths are matched after normalize_path(): no dot segments, and
+      // '%' kept only as an escape.
+      if (seg == "." || seg == "..") return std::string("segment '") + std::string(seg) + "' is a dot segment, which requests never have";
+      if (seg.find('%') != std::string_view::npos)
+        return std::string("segment '") + std::string(seg) + "' has a '%'; write the character itself, not its percent-encoding";
       out.push_back({false, seg});
     }
     if (slash == std::string_view::npos) break;

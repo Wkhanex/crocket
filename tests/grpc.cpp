@@ -193,6 +193,11 @@ int main() {
     CHECK_EQ(nested.error(), std::string("field 'addresses.zip': truncated varint"));
     auto range = proto::decode<HelloRequest>(std::string("\x70\xac\x02", 3));  // level = 300 into uint8_t
     CHECK_EQ(range.error(), std::string("field 'level': value 300 out of range"));
+    // A varint's 10th byte has room for bit 63 only.
+    auto wide = proto::decode<HelloRequest>(std::string("\x10\xff\xff\xff\xff\xff\xff\xff\xff\xff\x02", 11));
+    CHECK(!wide.has_value());
+    auto max = proto::decode<HelloRequest>(std::string("\x60\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01", 11));
+    CHECK(max.has_value());  // bit 63 set, in field 12 (bool): any nonzero is true
     auto overrun = proto::decode<HelloRequest>(std::string("\x0a\x05hi", 4));
     CHECK(contains(overrun.error(), "runs past the end"));
   }

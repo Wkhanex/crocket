@@ -38,6 +38,10 @@ enum class ProxyHeader : std::uint8_t {
 struct Config {
   std::size_t max_body_bytes = 1 << 20;               // 413 body.too_large
   std::size_t max_in_flight = 1024;                   // 503 server.busy
+  /// Request bodies held in memory at once, every request together: past it,
+  /// 503 server.busy. With max_body_bytes, it bounds what bodies can take
+  /// however many clients send them.
+  std::size_t max_body_memory = std::size_t(256) << 20;
   std::chrono::milliseconds request_timeout{30'000};  // 504 deadline.exceeded
   std::chrono::milliseconds drain_timeout{10'000};    // graceful shutdown budget
   bool debug_routes = false;                          // expose GET /__routes
@@ -79,6 +83,16 @@ struct LaunchOptions {
   std::size_t max_header_bytes = 8192;   // names + values; 431 headers.too_large
   std::size_t max_header_count = 100;    // 431 headers.too_large
   bool http2 = true;                     // offer h2 via ALPN when TLS is on
+  /// Open connections, all event loops together. Past it, new connections wait
+  /// in the kernel's accept queue until one closes, as in h2o (whose default
+  /// this is); they are not refused.
+  unsigned max_connections = 1024;
+  /// Open connections from one client address. Past it, a new one is closed at
+  /// once. 0, the default, is no limit: behind a load balancer every connection
+  /// comes from the balancer's address. Set it when clients connect directly.
+  unsigned max_connections_per_ip = 0;
+  /// Concurrent requests (streams) on one HTTP/2 connection (h2o's default).
+  unsigned http2_max_streams = 100;
   /// Without TLS, also accept HTTP/2 with prior knowledge (and Upgrade: h2c), as
   /// gRPC clients use on an insecure channel. HTTP/1.1 keeps working on the port.
   bool h2_prior_knowledge = false;
@@ -265,6 +279,9 @@ struct Stats {
   /// each one's current request (steady_clock nanoseconds; 0 when idle).
   std::atomic<unsigned> workers{0};
   std::unique_ptr<std::atomic<std::int64_t>[]> worker_deadline;
+  std::atomic<std::int64_t> connections{0};             // open now
+  std::atomic<std::uint64_t> connections_per_ip_closed{0};  // closed by max_connections_per_ip
+  std::atomic<std::int64_t> body_bytes{0};              // request bodies held now (max_body_memory)
 };
 
 /// An address range from Config::trusted_proxies (IPv4 as IPv4-mapped IPv6).

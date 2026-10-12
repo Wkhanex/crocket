@@ -143,6 +143,58 @@ expect "the queued handlers never ran" "2" "$(grep -c 'stubborn handler started'
 expect "  ... counted in crocket_requests_abandoned_total" "3" "$(( $(metric crocket_requests_abandoned_total) - abandoned ))"
 expect "a handler that outlives its deadline is logged" "2" "$(grep -c "after its request's deadline" "$WORK/serve.log")"
 
+echo "[connection and body limits]"
+LPORT=18444
+LBASE="https://127.0.0.1:$LPORT"
+start_limited() { # env assignments
+  env CROCKET_PORT=$LPORT CROCKET_TLS_CERT="$WORK/cert.pem" CROCKET_TLS_KEY="$WORK/key.pem" CROCKET_EVENT_LOOPS=2 "$@" \
+    "$SERVE" >"$WORK/limited.log" 2>&1 &
+  LIM_PID=$!
+  wait_up "$LBASE/healthz" || { echo "limited server did not start"; cat "$WORK/limited.log"; }
+}
+stop_limited() { kill -INT $LIM_PID; wait $LIM_PID 2>/dev/null; }
+start_limited CROCKET_MAX_CONNECTIONS=3 CROCKET_HTTP2_MAX_STREAMS=7 CROCKET_MAX_BODY_MEMORY=65536
+# Three idle connections take every slot; the next waits in the accept queue.
+exec {c1}<>/dev/tcp/127.0.0.1/$LPORT {c2}<>/dev/tcp/127.0.0.1/$LPORT {c3}<>/dev/tcp/127.0.0.1/$LPORT
+sleep 0.3
+expect "at max_connections a new connection waits" "000" \
+  "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 1 "$LBASE/healthz")"
+# (without copies of the held sockets, or closing them here would not close them)
+curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "$LBASE/healthz" >"$WORK/waited.code" {c1}>&- {c2}>&- {c3}>&- &
+WAITER=$!
+sleep 0.3
+exec {c1}>&-
+wait $WAITER
+expect "  ... and is served once one closes" "200" "$(cat "$WORK/waited.code")"
+exec {c2}>&- {c3}>&-
+sleep 0.3
+# The server's SETTINGS frame: SETTINGS_MAX_CONCURRENT_STREAMS (3) = 7.
+settings=$({ printf 'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00'; sleep 1; } |
+           timeout 5 openssl s_client -connect 127.0.0.1:$LPORT -alpn h2 -quiet 2>/dev/null | head -c 64 | od -An -tx1 | tr -d ' \n')
+expect_match "http2_max_streams is what SETTINGS advertises" "000300000007" "$settings"
+# max_body_memory (64 KiB): a body past it is 503, and what it held is freed.
+head -c 100000 /dev/zero | tr '\0' 'x' | sed 's/^/{"email":"/; s/$/"}/' >"$WORK/big.json"
+expect "bodies past max_body_memory: 503" "503" \
+  "$(curl -sk -o /dev/null -w '%{http_code}' -H 'content-type: application/json' --data-binary @"$WORK/big.json" "$LBASE/api/users")"
+expect "  ... then the memory is free again" "0" "$(curl -sk "$LBASE/metrics" | grep '^crocket_request_body_bytes ' | cut -d' ' -f2)"
+expect "  ... and a small body is taken (then Auth answers)" "401" \
+  "$(curl -sk -o /dev/null -w '%{http_code}' -H 'content-type: application/json' -d '{"email":"a@b.co"}' "$LBASE/api/users")"
+stop_limited
+start_limited CROCKET_MAX_CONNECTIONS_PER_IP=2
+exec {c1}<>/dev/tcp/127.0.0.1/$LPORT {c2}<>/dev/tcp/127.0.0.1/$LPORT
+sleep 0.3
+start=$(date +%s%N)
+code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 3 "$LBASE/healthz")
+took=$(( ($(date +%s%N) - start) / 1000000 ))
+expect_match "past max_connections_per_ip a connection is closed at once (${took} ms)" "^000 yes$" \
+  "$code $( ((took < 1500)) && echo yes || echo no)"
+exec {c1}>&- {c2}>&-
+sleep 0.3
+expect "  ... counted in crocket_connections_per_ip_closed_total" "1" \
+  "$(curl -sk "$LBASE/metrics" | grep '^crocket_connections_per_ip_closed_total ' | cut -d' ' -f2)"
+expect "  ... and served once the others close" "200" "$(curl -sk -o /dev/null -w '%{http_code}' "$LBASE/healthz")"
+stop_limited
+
 echo "[adaptive placement]"
 runs_on() { curl -sk "$BASE/__routes" | grep -o '"path":"/api/slow/{ms}","handler":"[^"]*","rank":[0-9-]*,"runs_on":"[^"]*"' | sed 's/.*"runs_on":"//; s/"$//'; }
 expect "a plain function starts on workers" "workers" "$(runs_on)"

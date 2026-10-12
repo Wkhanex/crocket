@@ -3,6 +3,51 @@ add_executable(crocket_acceptance acceptance.cpp)
 target_link_libraries(crocket_acceptance PRIVATE crocket)
 add_test(NAME acceptance COMMAND crocket_acceptance)
 
+# JSON reading, writing, annotations and validation, plus problem+json bodies.
+add_executable(crocket_json_test json.cpp)
+target_link_libraries(crocket_json_test PRIVATE crocket)
+add_test(NAME json COMMAND crocket_json_test)
+
+# Async handlers: suspension, resumption on workers, context, callback<T>, sleep_for.
+add_executable(crocket_async_test async.cpp)
+target_link_libraries(crocket_async_test PRIVATE crocket)
+add_test(NAME async COMMAND crocket_async_test)
+
+# The trie router against the linear scan it replaced, on random route tables.
+add_executable(crocket_router_test router.cpp)
+target_link_libraries(crocket_router_test PRIVATE crocket)
+target_include_directories(crocket_router_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME router COMMAND crocket_router_test)
+
+# The default number of event loops: physical cores from (fake) CPU topology.
+add_executable(crocket_cpus_test cpus.cpp)
+target_link_libraries(crocket_cpus_test PRIVATE crocket)
+target_include_directories(crocket_cpus_test PRIVATE ${PROJECT_SOURCE_DIR}/src)
+add_test(NAME cpus COMMAND crocket_cpus_test)
+
+add_executable(crocket_grpc_test grpc.cpp)
+target_link_libraries(crocket_grpc_test PRIVATE crocket)
+add_test(NAME grpc COMMAND crocket_grpc_test)
+
+# OpenAPI generated from the handlers, checked piece by piece, and served.
+add_executable(crocket_openapi_test openapi.cpp)
+target_link_libraries(crocket_openapi_test PRIVATE crocket)
+add_test(NAME openapi COMMAND crocket_openapi_test)
+
+# Fuzzing the parsers of untrusted input (tests/fuzz). Here each target runs its
+# corpus and then a few seconds of mutations; ./dev fuzz runs them for longer,
+# with coverage guidance and AddressSanitizer.
+add_executable(crocket_fuzz fuzz/fuzz.cpp fuzz/targets.cpp fuzz/h2.cpp)
+target_link_libraries(crocket_fuzz PRIVATE crocket)
+target_include_directories(crocket_fuzz PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_compile_definitions(crocket_fuzz PRIVATE CROCKET_FUZZ_CORPUS="${CMAKE_CURRENT_SOURCE_DIR}/fuzz/corpus")
+if(CROCKET_FUZZ_COVERAGE)
+  target_compile_options(crocket_fuzz PRIVATE -fsanitize-coverage=trace-pc)
+endif()
+foreach(target json json_typed proto query route request h2)
+  add_test(NAME fuzz.${target} COMMAND crocket_fuzz ${target} --seconds 2)
+endforeach()
+
 # Acceptance 5 and friends: programs that must NOT compile. Each is an
 # EXCLUDE_FROM_ALL object library; the test builds it and expects failure with
 # a diagnostic matching the regex (both identifiers for the capture mismatch).
@@ -21,7 +66,19 @@ crocket_compile_fail(unknown_extractor "parameter 'w' of type 'Widget' is not a 
 crocket_compile_fail(bad_return_type "NotAResponse")
 crocket_compile_fail(from_path_not_optional
   "json::from_path\\]\\] member 'id' of Widget must be std::optional<P>")
+crocket_compile_fail(bad_header_name "not a valid HTTP header name")
+crocket_compile_fail(proto_duplicate_field "members 'size' and 'colour' both have field number 2")
+crocket_compile_fail(proto_unmapped_type "member 'grade' of proto message Widget has type char, which has no protobuf mapping")
+crocket_compile_fail(rpc_two_messages "rpc bad::both: parameters 'a' and 'b' are both request messages")
 crocket_compile_fail(bad_template "capture .\\{id. must be a whole segment of the form \\{name\\}")
+crocket_compile_fail(json_name_clash
+  "members 'user_id' and 'legacy_id' of Account both have the JSON name \"userId\"")
+crocket_compile_fail(json_bad_pattern "invalid json::pattern \"\\^\\[A-Z\\]\\{3-\\}\\$\": expected '\\}' at offset 8")
+crocket_compile_fail(log_arg_count
+  "log message \"created user \\{user_id\\} on plan \\{plan\\}\": has 2 placeholders but 1 argument follow")
+crocket_compile_fail(log_reserved_field "placeholder \\{request_id\\} is a field crocket writes itself")
+crocket_compile_fail(json_check_type
+  "json::min/max\\]\\] on member 'name' of Signup needs a number, but the member is std::")
 
 # Control: the valid twin must compile (guards against the harness "passing"
 # because everything fails to build).
@@ -38,10 +95,16 @@ if(CURL AND OPENSSL AND CROCKET_BUILD_EXAMPLES)
   set_tests_properties(tls_h2 PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
 endif()
 
+# gRPC over real sockets: h2 prior knowledge and TLS, driven by curl.
+if(CURL AND OPENSSL AND CROCKET_BUILD_EXAMPLES)
+  add_test(NAME grpc_h2 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/grpc_h2.sh $<TARGET_FILE:crocket_grpc>)
+  set_tests_properties(grpc_h2 PROPERTIES TIMEOUT 120 RUN_SERIAL TRUE)
+endif()
+
 # An application that pulls crocket in with FetchContent builds and runs.
 add_test(NAME consumer
          COMMAND ${CMAKE_COMMAND} -DSRC=${PROJECT_SOURCE_DIR} -DBIN=${CMAKE_CURRENT_BINARY_DIR}/consumer
-                 -DLWS_SRC=${libwebsockets_SOURCE_DIR} -DCC=${CMAKE_C_COMPILER} -DCXX=${CMAKE_CXX_COMPILER}
+                 -DH2O_SRC=${h2o_SOURCE_DIR} -DCC=${CMAKE_C_COMPILER} -DCXX=${CMAKE_CXX_COMPILER}
                  "-DLAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}" "-DLDFLAGS=${CMAKE_EXE_LINKER_FLAGS}"
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/consumer.cmake)
 set_tests_properties(consumer PROPERTIES TIMEOUT 600)

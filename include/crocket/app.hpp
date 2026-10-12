@@ -1,13 +1,17 @@
 #pragma once
-// The application: managed state, fairings, mounted routes, ignite, listen.
+// Crocket, the application: managed state, fairings, mounted routes, ignite, launch.
 
 #include "crocket/detail/invoke.hpp"
 #include "crocket/http.hpp"
+#include "crocket/log.hpp"
 #include "crocket/request.hpp"
 #include "crocket/state.hpp"
 
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <coroutine>
+#include <functional>
 #include <cstdint>
 #include <expected>
 #include <memory>
@@ -24,14 +28,45 @@ namespace crocket {
 /// route banner, and error bodies that include ApiError::detail.
 enum class Profile : std::uint8_t { Release, Dev };
 
+/// Which header trusted proxies use to report the client.
+enum class ProxyHeader : std::uint8_t {
+  XForwardedFor,  // X-Forwarded-For and X-Forwarded-Proto (nginx, AWS ALB, Envoy, ...)
+  Forwarded,      // RFC 7239 Forwarded
+};
+
 /// Framework behaviour that is not about the socket.
 struct Config {
   std::size_t max_body_bytes = 1 << 20;               // 413 body.too_large
   std::size_t max_in_flight = 1024;                   // 503 server.busy
+  /// Request bodies held in memory at once, every request together: past it,
+  /// 503 server.busy. With max_body_bytes, it bounds what bodies can take
+  /// however many clients send them.
+  std::size_t max_body_memory = std::size_t(256) << 20;
+  /// A 200 to GET or HEAD without an ETag gets one, a hash of the body, when
+  /// the body is at most this long (hashing costs about a microsecond per 10
+  /// KiB). 0: never. Set an ETag yourself for larger bodies.
+  std::size_t etag_max_bytes = std::size_t(1) << 20;
   std::chrono::milliseconds request_timeout{30'000};  // 504 deadline.exceeded
   std::chrono::milliseconds drain_timeout{10'000};    // graceful shutdown budget
   bool debug_routes = false;                          // expose GET /__routes
   Profile profile = Profile::Release;
+
+  /// Proxies in front of the server, as addresses or CIDR ranges ("10.0.0.0/8",
+  /// "fd00::/8"). Requests from them have Request::remote_addr and scheme taken
+  /// from `proxy_header`; that header is ignored from everyone else.
+  std::vector<std::string> trusted_proxies = {};
+  ProxyHeader proxy_header = ProxyHeader::XForwardedFor;
+  /// Host names this server answers to ("api.example.com", "*.example.com").
+  /// Any other Host is 400 host.invalid. Empty allows every host; the dev
+  /// profile also allows localhost.
+  std::vector<std::string> allowed_hosts = {};
+  json::ReadOptions json = {};                        // limits for Json<T> bodies
+  /// Run a plain-function route on the event loops once it has proved fast
+  /// (1,000 runs in a row under 100 us), and back on workers when it turns out
+  /// to block there (one run over 50 ms, or 8 over 1 ms within a second). Off:
+  /// plain functions always run on workers.
+  bool adaptive_placement = true;
+  log::Options log = {};                              // level, sampling, redaction, sink
 
   /// Dev defaults: GET /__routes, a one-hour deadline (room for a debugger
   /// breakpoint), a one-second drain, and listening on 127.0.0.1.
@@ -42,15 +77,34 @@ struct Config {
 };
 
 /// Socket, TLS and threading. TLS is enabled when both cert and key are set.
-struct ListenOptions {
+struct LaunchOptions {
   std::string host = {};  // empty: 0.0.0.0, or 127.0.0.1 in the dev profile
   std::uint16_t port = 8000;
   std::string tls_cert = {};
   std::string tls_key = {};
-  unsigned workers = 0;                  // 0 = hardware concurrency
-  std::size_t max_header_bytes = 8192;   // lws header buffer (max 65535)
+  unsigned workers = 0;                  // handler threads; 0 = hardware concurrency
+  unsigned event_loops = 0;              // network I/O threads; 0 = one per physical core
+  std::size_t max_header_bytes = 8192;   // names + values; 431 headers.too_large
+  std::size_t max_header_count = 100;    // 431 headers.too_large
   bool http2 = true;                     // offer h2 via ALPN when TLS is on
+  /// Open connections, all event loops together. Past it, new connections wait
+  /// in the kernel's accept queue until one closes, as in h2o (whose default
+  /// this is); they are not refused.
+  unsigned max_connections = 1024;
+  /// Open connections from one client address. Past it, a new one is closed at
+  /// once. 0, the default, is no limit: behind a load balancer every connection
+  /// comes from the balancer's address. Set it when clients connect directly.
+  unsigned max_connections_per_ip = 0;
+  /// Concurrent requests (streams) on one HTTP/2 connection (h2o's default).
+  unsigned http2_max_streams = 100;
+  /// Without TLS, also accept HTTP/2 with prior knowledge (and Upgrade: h2c), as
+  /// gRPC clients use on an insecure channel. HTTP/1.1 keeps working on the port.
+  bool h2_prior_knowledge = false;
 };
+
+/// What a mount serves. Http mounts take a path prefix ("/api"); Grpc mounts
+/// take a protobuf package ("helloworld", or "" for none).
+enum class Mode : std::uint8_t { Http, Grpc };
 
 /// One handler parameter as shown by /__routes.
 struct ParamInfo {
@@ -61,6 +115,9 @@ struct ParamInfo {
 
 namespace detail {
 enum class Builtin : std::uint8_t { None, Healthz, Readyz, Routes };
+namespace openapi {
+struct Operation;
+}
 }
 
 /// A route, as produced by reflect_routes() and adjusted by mount().
@@ -73,6 +130,12 @@ struct RouteDef {
   std::vector<detail::StateDep> needs;
   detail::Invoker invoke = nullptr;
   detail::Builtin builtin = detail::Builtin::None;
+  bool async = false;  // the handler returns Task<T> (or another awaitable): it runs on the event loop
+  bool may_block = false;  // takes an extractor that may wait (State<Pool<T>>): always on workers
+  Mode mode = Mode::Http;
+  std::string_view service;  // gRPC: "Greeter"
+  std::string_view rpc;      // gRPC: "SayHello"
+  void (*openapi)(detail::openapi::Operation&) = nullptr;  // describes it for OpenApi (HTTP routes)
 };
 
 using Routes = std::vector<RouteDef>;
@@ -82,7 +145,7 @@ struct IgniteError {
   [[nodiscard]] std::string message() const;
 };
 
-class App;
+class Crocket;
 class Ignite;
 
 namespace detail {
@@ -132,18 +195,120 @@ struct ReadyCheck {
   bool (*check)(void*);
 };
 
+/// Runs jobs on worker threads: the engine's pool while launched.
+struct Executor {
+  virtual ~Executor() = default;
+  virtual void post(std::move_only_function<void()> job) = 0;
+};
+
+/// One request in flight. Owns the Request and Response at a fixed address
+/// while the handler, possibly suspended across threads, refers to them, and
+/// delivers the Response once.
+class Exchange {
+ public:
+  using Done = std::move_only_function<void(Response&&)>;
+  Exchange(Crocket& app, Request&& rq, Done done, Executor* loop)
+      : req(std::move(rq)), loop(loop), app_(app), done_(std::move(done)) {}
+
+  Request req;
+  Response res;
+  /// The event loop running this request (async handlers stay on it), or null
+  /// on a worker or in LocalClient.
+  Executor* loop;
+  bool reroute = false;  // routing found a handler that may block: route again on a worker
+  bool loop_hold_reported = false;  // a promoted plain function ran here: its demotion says it all
+
+  /// The async handler finished filling `res`. Completes the request, unless
+  /// the pipeline has not yet seen it suspend (it completes it then).
+  void handler_done();
+  /// Resumes `h` with this request's context: on its event loop, else on a worker.
+  void post(std::coroutine_handle<> h);
+
+ private:
+  friend class crocket::Crocket;
+  enum : int { Running, Suspended, FinishedEarly };
+  /// After the handler suspended: false if it has finished meanwhile.
+  bool suspend() {
+    int expected = Running;
+    return state_.compare_exchange_strong(expected, Suspended);
+  }
+  Crocket& app_;
+  Done done_;
+  std::atomic<int> state_{Running};
+};
+
+/// Workers when no engine runs (LocalClient, tasks outside requests).
+Executor& fallback_executor();
+
+/// Where a plain-function route runs, learned from how long it takes
+/// (Config::adaptive_placement). One per route, built at ignite.
+struct Placement {
+  static constexpr std::uint32_t kPromoteAfter = 1000;               // fast runs in a row on workers
+  static constexpr std::chrono::microseconds kFast{100};              // ... each under this
+  // On a loop, a run's wall time also counts time the thread was not on a CPU
+  // (the OS ran something else), so one slow run is not proof of blocking:
+  static constexpr std::chrono::milliseconds kStall{50};      // one run over this: demoted at once
+  static constexpr std::chrono::milliseconds kSlow{1};        // kStrikes runs over this ...
+  static constexpr std::uint32_t kStrikes = 8;
+  static constexpr std::chrono::seconds kStrikeWindow{1};     // ... within this: demoted
+  static constexpr std::chrono::seconds kRetryAfter{10};      // doubled per demotion
+  std::atomic<bool> on_loop{false};
+  std::atomic<std::uint32_t> strikes{0};
+  std::atomic<std::int64_t> strikes_since{0};  // steady_clock ticks: start of the strike window
+  std::atomic<std::uint32_t> fast_runs{0};
+  std::atomic<std::uint32_t> demotions{0};
+  std::atomic<std::int64_t> retry_at{0};  // steady_clock ticks; no promotion before
+};
+
+/// Measures how long a request holds its event loop; warns (once per handler)
+/// past kLoopHoldWarning, since every connection on the loop waits meanwhile.
+inline constexpr std::chrono::milliseconds kLoopHoldWarning{10};
+struct LoopHold {
+  std::string_view handler;  // static storage (RouteDef); may be set after construction
+  bool report = true;
+  std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+  explicit LoopHold(std::string_view h = {}) : handler(h) {}
+  ~LoopHold();
+};
+
 /// Counters the framework maintains itself (read by Metrics).
 struct Stats {
   std::atomic<std::int64_t> in_flight{0};
   std::atomic<bool> draining{false};
+  std::atomic<std::uint64_t> log_dropped{0};
+  /// Requests whose handler never ran: the deadline passed, or the client went
+  /// away, while they waited for a worker.
+  std::atomic<std::uint64_t> abandoned{0};
+  /// The engine's workers while launched (0 otherwise), and the deadline of
+  /// each one's current request (steady_clock nanoseconds; 0 when idle).
+  std::atomic<unsigned> workers{0};
+  std::unique_ptr<std::atomic<std::int64_t>[]> worker_deadline;
+  std::atomic<std::int64_t> connections{0};             // open now
+  std::atomic<std::uint64_t> connections_per_ip_closed{0};  // closed by max_connections_per_ip
+  std::atomic<std::int64_t> body_bytes{0};              // request bodies held now (max_body_memory)
 };
 
-struct AppCore {
+/// An address range from Config::trusted_proxies (IPv4 as IPv4-mapped IPv6).
+struct IpRange {
+  std::array<std::uint8_t, 16> addr{};
+  int prefix = 0;
+};
+
+struct Core {
   Config config;
+  std::vector<IpRange> trusted_proxies;  // parsed at ignite
+  std::shared_ptr<log::detail::Hub> log;  // where this app's log lines go
+  std::atomic<Executor*> executor{nullptr};  // the engine's workers while launched
+  std::unique_ptr<Placement[]> placement;    // per route (Config::adaptive_placement)
   StateRegistry state;
   std::vector<std::unique_ptr<FairingBase>> fairings;
   std::vector<ReadyCheck> ready_checks;
-  std::vector<std::pair<std::string, Routes>> mounts;
+  struct Mount {
+    std::string base;
+    Routes routes;
+    Mode mode;
+  };
+  std::vector<Mount> mounts;
   std::vector<std::string> build_errors;  // reported at ignite
   Routes routes;                          // final table, built at ignite
   std::shared_ptr<Router> router;         // built at ignite
@@ -162,25 +327,26 @@ class Ignite {
   [[nodiscard]] const Config& config() const { return core_.config; }
   [[nodiscard]] std::span<const RouteDef> routes() const { return core_.routes; }
   [[nodiscard]] const detail::Stats& stats() const { return core_.stats; }
+  [[nodiscard]] const std::shared_ptr<log::detail::Hub>& log_hub() const { return core_.log; }
 
  private:
-  friend class App;
-  Ignite(detail::AppCore& c, std::vector<std::string>& e) : core_(c), errors_(e) {}
-  detail::AppCore& core_;
+  friend class Crocket;
+  Ignite(detail::Core& c, std::vector<std::string>& e) : core_(c), errors_(e) {}
+  detail::Core& core_;
   std::vector<std::string>& errors_;
 };
 
-class App {
+class Crocket {
  public:
-  explicit App(Config cfg = {});
-  App(App&&) noexcept;
-  App& operator=(App&&) noexcept;
-  ~App();
+  explicit Crocket(Config cfg = {});
+  Crocket(Crocket&&) noexcept;
+  Crocket& operator=(Crocket&&) noexcept;
+  ~Crocket();
 
   /// Store exactly one T. A second manage<T>() is an ignite error.
   /// If T has `bool ready() const`, GET /readyz calls it.
   template <class T>
-  App& manage(T value) & {
+  Crocket& manage(T value) & {
     auto name = detail::type_display_name<T>();
     if (!core_->state.put<T>(std::move(value)))
       core_->build_errors.push_back(std::string("manage<") + name + ">() called twice");
@@ -190,53 +356,80 @@ class App {
     return *this;
   }
   template <class T>
-  App&& manage(T value) && { return std::move(manage(std::move(value))); }
+  Crocket&& manage(T value) && { return std::move(manage(std::move(value))); }
 
   /// Attach a fairing. on_request runs in attach order, on_response in
   /// reverse. Fairings run on worker threads concurrently: keep them short,
   /// synchronous and thread-safe.
   template <class F>
-  App& attach(F fairing) & {
+  Crocket& attach(F fairing) & {
     core_->fairings.push_back(std::make_unique<detail::FairingModel<F>>(std::move(fairing)));
     return *this;
   }
   template <class F>
-  App&& attach(F fairing) && { return std::move(attach(std::move(fairing))); }
+  Crocket&& attach(F fairing) && { return std::move(attach(std::move(fairing))); }
 
-  App& mount(std::string_view base, Routes routes) &;
-  App&& mount(std::string_view base, Routes routes) && { return std::move(mount(base, std::move(routes))); }
+  /// Serve `routes` under `base`. Mode::Grpc serves [[= grpc::rpc]] methods
+  /// with `base` as the protobuf package: POST /<package>.<Service>/<Method>.
+  Crocket& mount(std::string_view base, Routes routes, Mode mode = Mode::Http) &;
+  Crocket&& mount(std::string_view base, Routes routes, Mode mode = Mode::Http) && {
+    return std::move(mount(base, std::move(routes), mode));
+  }
 
-  App& configure(Config cfg) &;
-  App&& configure(Config cfg) && { return std::move(configure(std::move(cfg))); }
+  Crocket& configure(Config cfg) &;
+  Crocket&& configure(Config cfg) && { return std::move(configure(std::move(cfg))); }
 
   /// Validate everything and freeze the route table. Idempotent.
   std::expected<void, IgniteError> ignite();
 
   /// Ignite, serve until SIGINT/SIGTERM, drain, shut down. Returns an exit
-  /// status (non-zero when ignite or listen fails).
-  int listen(ListenOptions opts);
+  /// status (non-zero when ignite or launch fails).
+  int launch(LaunchOptions opts);
 
   /// The full request pipeline: request id, fairings, routing, extractors,
-  /// handler, responder, error mapping. Used by the engine and LocalClient.
+  /// handler, responder, error mapping. `done` gets the response exactly once:
+  /// before handle_async returns, or later, when an async handler finishes.
+  /// Called on an event loop (`loop`), async handlers run and resume there, and
+  /// a synchronous handler moves to a worker. Used by the engine.
+  void handle_async(Request&& req, std::move_only_function<void(Response&&)> done, detail::Executor* loop = nullptr);
+  /// Whether every route that can answer method+path runs on the event loop
+  /// (an async handler, or a plain function adaptive placement has promoted),
+  /// or none does (crocket answers 404 or 405), so the loop can run the request itself.
+  [[nodiscard]] bool loop_route(http::Method method, std::string_view path) const;
+  /// handle_async, waiting for the response. Used by LocalClient.
   Response handle(Request req);
 
   /// Build an error response for a request rejected before routing
   /// (limits, timeouts). Runs on_response fairings so logs/metrics see it.
   Response reject(Request& req, const ApiError& err);
 
+  /// Returns once every log line so far has been written (the writer is asynchronous).
+  void flush_logs() const;
+
   /// Assign request id, deadline and state pointer. Idempotent.
   void prepare(Request& req) const;
 
   [[nodiscard]] const Config& config() const { return core_->config; }
   [[nodiscard]] std::span<const RouteDef> routes() const { return core_->routes; }
-  [[nodiscard]] detail::AppCore& core() { return *core_; }
+  [[nodiscard]] detail::Core& core() { return *core_; }
 
  private:
-  Response run_routes(Request& req);
+  friend class detail::Exchange;
+  void run(detail::Exchange* ex);       // the pipeline; completes ex unless its handler suspended
+  void complete(detail::Exchange* ex);  // finish, deliver and free
+  void warn_if_late(const Request& req) const;  // logs a handler that outlived its deadline
+  /// Routes req; true if the handler suspended (it completes the exchange later).
+  bool run_routes(Request& req, Response& res);
+  [[nodiscard]] bool runs_on_loop(const RouteDef& def) const;
+  void ran_on_worker(const RouteDef& def, std::chrono::steady_clock::duration took);
+  void ran_on_loop(const RouteDef& def, std::chrono::steady_clock::duration took);
   Response builtin(detail::Builtin b, Request& req);
   void finish(const Request& req, Response& res);
-  std::unique_ptr<detail::AppCore> core_;
+  std::unique_ptr<detail::Core> core_;
 };
+
+/// Start a Crocket: `crocket::build(cfg).attach(...).mount(...).launch({...})`.
+[[nodiscard]] inline Crocket build(Config cfg = {}) { return Crocket{std::move(cfg)}; }
 
 /// In-process client for tests: same pipeline as the network engine,
 /// no sockets. Construction ignites the app and throws on ignite failure.
@@ -251,17 +444,30 @@ class LocalClient {
       req_.body = std::move(b);
       return *this;
     }
+    /// The socket peer's address, e.g. a proxy's ("10.0.0.5").
+    Call& remote(std::string_view addr) { req_.peer_addr = addr; return *this; }
     Call& bearer(std::string_view token) { return header("authorization", std::string("Bearer ") + std::string(token)); }
-    Response dispatch() { return app_.handle(std::move(req_)); }
+    /// Handles the request, then waits until its log lines are written, so a
+    /// test can read them.
+    Response dispatch() {
+      if (req_.path.empty()) {  // a NUL in the path: the engine's 400
+        auto res = app_.reject(req_, {400, "http.invalid", "invalid request path", {}});
+        app_.flush_logs();
+        return res;
+      }
+      auto res = app_.handle(std::move(req_));
+      app_.flush_logs();
+      return res;
+    }
 
    private:
     friend class LocalClient;
-    Call(App& app, http::Method m, std::string_view target);
-    App& app_;
+    Call(Crocket& app, http::Method m, std::string_view target);
+    Crocket& app_;
     Request req_;
   };
 
-  explicit LocalClient(App& app);
+  explicit LocalClient(Crocket& app);
   Call get(std::string_view target) { return {app_, http::Method::Get, target}; }
   Call head(std::string_view target) { return {app_, http::Method::Head, target}; }
   Call post(std::string_view target) { return {app_, http::Method::Post, target}; }
@@ -269,17 +475,31 @@ class LocalClient {
   Call patch(std::string_view target) { return {app_, http::Method::Patch, target}; }
   Call del(std::string_view target) { return {app_, http::Method::Delete, target}; }
   Call options(std::string_view target) { return {app_, http::Method::Options, target}; }
+  /// A unary gRPC call: `client.grpc("/helloworld.Greeter/SayHello", proto::encode(req))`.
+  Call grpc(std::string_view path, std::string_view message);
 
  private:
-  App& app_;
+  Crocket& app_;
 };
 
 namespace detail {
 std::string percent_decode(std::string_view s, bool plus_is_space);
+/// The path a request is routed on, from the target's path (before any '?'):
+/// split on '/', each segment percent-decoded, "." and ".." segments removed
+/// (RFC 3986 5.2.4), and a '%' or '/' inside a segment written %25 or %2F, so
+/// the result splits into exactly those segments ("/files/a%2Fb" stays two).
+/// nullopt when a segment decodes to a NUL. The engine and LocalClient both
+/// use it, so in-process tests route as production does.
+std::optional<std::string> normalize_path(std::string_view raw);
 std::vector<std::pair<std::string, std::string>> parse_query(std::string_view q);
 std::string generate_request_id();
+/// On a worker thread: the deadline of the request it now runs (for
+/// crocket_workers_stuck). Elsewhere, nothing.
+void note_worker_deadline(Clock::time_point at);
 std::string_view reason_phrase(int status);
 std::string iso8601_now();
+/// iso8601_now() appended to `out`, without a temporary (log lines use it).
+void append_iso8601_now(std::string& out);
 }  // namespace detail
 
 }  // namespace crocket

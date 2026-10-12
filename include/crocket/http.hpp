@@ -1,9 +1,10 @@
 #pragma once
 // HTTP vocabulary shared by handlers, the router, and the engine.
-// Nothing in this header knows about libwebsockets.
+// Nothing in this header knows about the wire engine.
 
 #include <meta>
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -12,6 +13,18 @@
 #include <vector>
 
 namespace crocket {
+
+namespace detail {
+/// std::to_string for compile-time diagnostics (libstdc++'s is not constexpr).
+constexpr std::string decimal(long long v) {
+  if (v == 0) return "0";
+  bool neg = v < 0;
+  unsigned long long u = neg ? 0ULL - static_cast<unsigned long long>(v) : static_cast<unsigned long long>(v);
+  std::string s;
+  for (; u; u /= 10) s.insert(s.begin(), char('0' + u % 10));
+  return neg ? "-" + s : s;
+}
+}  // namespace detail
 
 namespace http {
 
@@ -92,6 +105,11 @@ constexpr std::string parse_template(std::string_view path, std::vector<Segment>
       if (seg.find_first_of("{}") != std::string_view::npos)
         return std::string("segment '") + std::string(seg) +
                "' mixes literal text and a capture; captures must be whole segments";
+      // Request paths are matched after normalize_path(): no dot segments, and
+      // '%' kept only as an escape.
+      if (seg == "." || seg == "..") return std::string("segment '") + std::string(seg) + "' is a dot segment, which requests never have";
+      if (seg.find('%') != std::string_view::npos)
+        return std::string("segment '") + std::string(seg) + "' has a '%'; write the character itself, not its percent-encoding";
       out.push_back({false, seg});
     }
     if (slash == std::string_view::npos) break;
@@ -131,6 +149,12 @@ consteval Route patch(std::string_view p, RouteOptions o = {}) { return route(Me
 consteval Route del(std::string_view p, RouteOptions o = {}) { return route(Method::Delete, p, o); }
 consteval Route options(std::string_view p, RouteOptions o = {}) { return route(Method::Options, p, o); }
 
+/// An HTTP date (RFC 9110 IMF-fixdate), "Sun, 06 Nov 1994 08:49:37 GMT", for
+/// headers such as Last-Modified.
+std::string date(std::chrono::system_clock::time_point t);
+/// Parses an IMF-fixdate; nullopt for anything else.
+std::optional<std::chrono::sys_seconds> parse_date(std::string_view s);
+
 }  // namespace http
 
 /// Header list with lowercase names (HTTP/2 requires lowercase; HTTP/1.1 is
@@ -140,12 +164,15 @@ class Headers {
   using value_type = std::pair<std::string, std::string>;
 
   void add(std::string_view name, std::string_view value) {
+    reserve();
     items_.emplace_back(lower(name), std::string(value));
   }
+  /// Replaces every field named `name` with one, or adds it.
   void set(std::string_view name, std::string_view value) {
-    auto n = lower(name);
-    std::erase_if(items_, [&](auto& kv) { return kv.first == n; });
-    items_.emplace_back(std::move(n), std::string(value));
+    auto it = std::ranges::find_if(items_, [&](auto& kv) { return iequals(kv.first, name); });
+    if (it == items_.end()) return add(name, value);
+    it->second.assign(value);
+    items_.erase(std::remove_if(it + 1, items_.end(), [&](auto& kv) { return iequals(kv.first, name); }), items_.end());
   }
   void remove(std::string_view name) {
     auto n = lower(name);
@@ -160,6 +187,7 @@ class Headers {
   [[nodiscard]] auto begin() const { return items_.begin(); }
   [[nodiscard]] auto end() const { return items_.end(); }
   [[nodiscard]] std::size_t size() const { return items_.size(); }
+  [[nodiscard]] bool empty() const { return items_.empty(); }
 
   static bool iequals(std::string_view a, std::string_view b) {
     return std::ranges::equal(a, b, [](char x, char y) { return ascii_lower(x) == ascii_lower(y); });
@@ -167,6 +195,10 @@ class Headers {
 
  private:
   static constexpr char ascii_lower(char c) { return (c >= 'A' && c <= 'Z') ? char(c + 32) : c; }
+  // Most messages carry a handful of fields: no regrowth for the first 8.
+  void reserve() {
+    if (items_.capacity() == 0) items_.reserve(8);
+  }
   static std::string lower(std::string_view s) {
     std::string r(s);
     for (auto& c : r) c = ascii_lower(c);

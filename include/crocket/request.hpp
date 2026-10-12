@@ -1,11 +1,14 @@
 #pragma once
 // Request / Response as the framework sees them. The engine fills a Request,
-// the App turns it into a Response. Handlers normally never touch either:
+// Crocket turns it into a Response. Handlers normally never touch either:
 // they take extractors and return responders. `const Request&` and
 // `Response&` parameters exist as an escape hatch.
 
 #include "crocket/http.hpp"
 
+#include <array>
+#include <initializer_list>
+#include <memory>
 #include <chrono>
 #include <stop_token>
 #include <string>
@@ -14,13 +17,23 @@
 
 namespace crocket {
 
-/// The error shape for every failure the framework or a handler reports.
-/// `message` goes to the client; `detail` only goes to logs.
+/// One invalid field of a request, listed under "errors" in the problem body.
+struct FieldError {
+  std::string pointer;  // RFC 6901 JSON Pointer into the request body: "/items/0/name"
+  std::string detail;   // "must be at least 1"
+};
+
+/// The error shape for every failure the framework or a handler reports, sent
+/// as RFC 9457 application/problem+json. `message` goes to the client (as
+/// "detail"); `detail` only goes to logs, and to the body in the dev profile.
 struct ApiError {
   int status = 500;
   std::string_view code = "internal";  // stable, dotted: "auth.expired"
   std::string message = "internal error";
   std::string detail = {};
+  int grpc_status = -1;  // explicit gRPC status code; -1 derives it from `status`
+  std::vector<FieldError> errors = {};  // per-field failures, e.g. from validation
+  std::string_view type = {};           // problem type URI; empty means "about:blank"
 
   static ApiError not_found(std::string msg = "not found") { return {404, "not_found", std::move(msg), {}}; }
   static ApiError bad_request(std::string_view code, std::string msg) { return {400, code, std::move(msg), {}}; }
@@ -31,7 +44,44 @@ struct ApiError {
   static ApiError internal(std::string detail) { return {500, "internal", "internal error", std::move(detail)}; }
 };
 
+namespace json {
+/// Limits and strictness for reading JSON. Config::json sets them for every
+/// Json<T> body; exceeding a limit is 422 json.limit_exceeded.
+struct ReadOptions {
+  std::size_t max_depth = 64;                  // nested arrays and objects
+  std::size_t max_string_bytes = 1 << 20;      // one string or key, after unescaping
+  std::size_t max_object_members = 1024;       // members of one object
+  std::size_t max_array_elements = 100'000;    // elements of one array
+  bool deny_unknown_fields = false;            // as if every struct had [[= json::deny_unknown_fields]]
+};
+}  // namespace json
+
 using Clock = std::chrono::steady_clock;
+
+/// The matched route's capture values, in template order. Fixed capacity, so
+/// routing allocates nothing; ignite rejects a route with more captures.
+class Captures {
+ public:
+  static constexpr std::size_t capacity = 16;
+  Captures() = default;
+  Captures(std::initializer_list<std::string_view> values) {
+    for (auto v : values) push_back(v);
+  }
+  void push_back(std::string_view v) noexcept {
+    if (n_ < capacity) items_[n_++] = v;
+  }
+  void clear() noexcept { n_ = 0; }
+  void set(std::size_t i, std::string_view v) noexcept { items_[i] = v; }
+  [[nodiscard]] std::size_t size() const noexcept { return n_; }
+  [[nodiscard]] bool empty() const noexcept { return n_ == 0; }
+  [[nodiscard]] std::string_view operator[](std::size_t i) const noexcept { return items_[i]; }
+  [[nodiscard]] const std::string_view* begin() const noexcept { return items_.data(); }
+  [[nodiscard]] const std::string_view* end() const noexcept { return items_.data() + n_; }
+
+ private:
+  std::array<std::string_view, capacity> items_{};
+  std::size_t n_ = 0;
+};
 
 /// Deadline and cancellation for one request. Available to blocking
 /// extractors (e.g. pool checkout) and to handlers as an extractor.
@@ -48,7 +98,11 @@ struct Deadline {
   }
 };
 
-namespace detail { class StateRegistry; }
+struct RouteDef;
+namespace detail {
+class StateRegistry;
+class Exchange;
+}  // namespace detail
 
 struct Request {
   http::Method method = http::Method::Get;
@@ -61,18 +115,29 @@ struct Request {
   // Connection facts, set by the engine.
   std::string_view protocol = "local";  // "http/1.1", "h2", or "local"
   bool tls = false;
-  std::string remote_addr;
+  std::string peer_addr;  // the socket's peer: the client, or the nearest proxy
+
+  // The client, as Config::trusted_proxies report it; otherwise the connection's.
+  std::string remote_addr;  // e.g. "203.0.113.9"
+  std::string_view scheme;  // "https" or "http"
 
   // Set by the framework before fairings run.
   std::string request_id;
+  std::string trace_id;  // from a valid W3C traceparent header; empty without one
+  std::string subject;   // who the request is from, once Auth has verified it
   Clock::time_point received = Clock::now();
   Deadline deadline;
   bool dev_profile = false;  // error bodies include ApiError::detail
+  json::ReadOptions json_options;  // Config::json
 
   // Set by the router for the candidate currently being tried.
   std::string_view route_template;  // "/users/{id}"; "" while unmatched
+  const RouteDef* route = nullptr;   // the candidate's definition; null while unmatched
   std::string_view handler;         // "api::create"
-  std::vector<std::string_view> captures;
+  Captures captures;
+  /// Captures that held a %2F or %25, decoded ("a%2Fb" -> "a/b"); `captures`
+  /// views into it. Shared, so a copy of the request keeps them valid.
+  std::shared_ptr<std::vector<std::string>> decoded_captures;
 
   [[nodiscard]] std::optional<std::string_view> header(std::string_view name) const {
     return headers.get(name);
@@ -104,12 +169,17 @@ struct Request {
 
   // Framework-internal: managed state lookup for State<T>.
   const detail::StateRegistry* state_registry = nullptr;
+  detail::Exchange* exchange = nullptr;  // set while the pipeline runs
 };
 
 struct Response {
+  // For a gRPC response (content-type application/grpc) the wire status is
+  // always 200 and the outcome travels in grpc-status; `status` then holds the
+  // HTTP equivalent of that outcome, so logs and metrics read the same either way.
   int status = 200;
   Headers headers;
   std::string body;
+  Headers trailers;  // sent after the body; HTTP/2 only (gRPC needs them)
 
   // Observability, never sent to the client.
   std::string_view error_code;    // set for error responses

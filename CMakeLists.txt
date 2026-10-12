@@ -3,8 +3,11 @@ project(crocket VERSION 0.1.0 LANGUAGES C CXX)
 
 # Examples and tests are for working on crocket; a project that pulls crocket
 # in with FetchContent or add_subdirectory doesn't build them.
-option(CROCKET_BUILD_EXAMPLES "Build crocket_hello and crocket_serve" ${PROJECT_IS_TOP_LEVEL})
+option(CROCKET_BUILD_EXAMPLES "Build crocket_hello, crocket_serve and crocket_grpc" ${PROJECT_IS_TOP_LEVEL})
 option(CROCKET_BUILD_TESTS "Build the tests" ${PROJECT_IS_TOP_LEVEL})
+# ./dev fuzz: crocket and the fuzz targets report coverage to tests/fuzz, so
+# inputs that reach new code are kept and mutated further.
+option(CROCKET_FUZZ_COVERAGE "Instrument crocket for coverage-guided fuzzing" OFF)
 
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,61 +34,62 @@ if(CMAKE_LINKER_TYPE)
   message(STATUS "crocket: linking with ${CMAKE_LINKER_TYPE}")
 endif()
 
-# ---- libwebsockets (the only wire engine) ---------------------------------
-include(FetchContent)
-# lws 4.3.5 declares an old cmake_minimum_required that CMake 4 rejects.
-set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
-# lws's settings are plain variables in this directory, not cache entries, so
-# they don't leak into a consumer's cache. CMP0077 lets option() honour them
-# despite lws's old policy version.
-set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
-set(LWS_WITH_HTTP2 ON)
-set(LWS_WITH_SSL ON)
-set(LWS_WITH_HTTP_UNCOMMON_HEADERS ON)
-set(LWS_WITH_CUSTOM_HEADERS ON)
-set(LWS_WITH_SHARED OFF)
-set(LWS_WITH_STATIC ON)
-set(LWS_WITHOUT_TESTAPPS ON)
-set(LWS_WITHOUT_TEST_SERVER ON)
-set(LWS_WITHOUT_TEST_SERVER_EXTPOLL ON)
-set(LWS_WITHOUT_TEST_PING ON)
-set(LWS_WITHOUT_TEST_CLIENT ON)
-set(LWS_WITH_MINIMAL_EXAMPLES OFF)
-set(LWS_WITHOUT_EXTENSIONS ON)
-set(LWS_WITH_EXPORT_LWSTARGETS OFF)
-set(DISABLE_WERROR ON)
-FetchContent_Declare(libwebsockets
-  GIT_REPOSITORY https://github.com/warmcat/libwebsockets.git
-  GIT_TAG v4.3.5
-  GIT_SHALLOW TRUE
-  SYSTEM)
-FetchContent_MakeAvailable(libwebsockets)
+# ---- h2o (the only wire engine) ---------------------------------------------
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/h2o.cmake)
 
 # ---- crocket ---------------------------------------------------------------
 find_package(Threads REQUIRED)
 
 add_library(crocket STATIC
   src/app.cpp
+  src/cpus.cpp
+  src/async.cpp
+  src/log.cpp
+  src/conditional.cpp
+  src/identity.cpp
   src/router.cpp
   src/json.cpp
   src/http.cpp
   src/fairings.cpp
-  src/engine_lws.cpp)
+  src/openapi.cpp
+  src/grpc.cpp
+  src/engine_h2o.cpp)
 add_library(crocket::crocket ALIAS crocket)
 target_include_directories(crocket PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # Users of crocket need C++26 and reflection too, so both are PUBLIC.
 target_compile_features(crocket PUBLIC cxx_std_26)
 target_compile_options(crocket PUBLIC -freflection)
 target_compile_options(crocket PRIVATE -Wall -Wextra)
-# lws is PRIVATE: application code never sees libwebsockets headers.
-target_link_libraries(crocket PRIVATE websockets PUBLIC Threads::Threads)
+# h2o is PRIVATE: application code never sees h2o headers. Only the engine
+# includes them.
+target_include_directories(crocket SYSTEM PRIVATE ${CROCKET_H2O_INCLUDE_DIRS})
+target_compile_definitions(crocket PRIVATE ${CROCKET_H2O_DEFINITIONS})
+target_link_libraries(crocket PRIVATE libh2o-evloop PUBLIC Threads::Threads)
+if(CROCKET_FUZZ_COVERAGE)
+  target_compile_options(crocket PRIVATE -fsanitize-coverage=trace-pc)
+endif()
 
 if(CROCKET_BUILD_EXAMPLES)
   add_executable(crocket_hello examples/hello.cpp)
   target_link_libraries(crocket_hello PRIVATE crocket)
   add_executable(crocket_serve examples/serve.cpp)
   target_link_libraries(crocket_serve PRIVATE crocket)
+  add_executable(crocket_grpc examples/grpc.cpp)
+  target_link_libraries(crocket_grpc PRIVATE crocket)
 endif()
+
+# Benchmarks (./dev bench). Built only on request, never by `all` or ctest.
+add_executable(crocket_bench EXCLUDE_FROM_ALL bench/server.cpp)
+target_link_libraries(crocket_bench PRIVATE crocket)
+add_executable(crocket_microbench EXCLUDE_FROM_ALL bench/micro.cpp)
+target_link_libraries(crocket_microbench PRIVATE crocket)
+target_include_directories(crocket_microbench PRIVATE src)  # the router, measured directly
+# h2o alone, answering the same scenarios from constants: crocket's floor (./dev bench --vs-h2o).
+add_executable(crocket_bench_h2o EXCLUDE_FROM_ALL bench/h2o.cpp src/cpus.cpp)
+target_include_directories(crocket_bench_h2o SYSTEM PRIVATE ${CROCKET_H2O_INCLUDE_DIRS})
+target_include_directories(crocket_bench_h2o PRIVATE src)  # cpus.hpp: the same event loop count as crocket
+target_compile_definitions(crocket_bench_h2o PRIVATE ${CROCKET_H2O_DEFINITIONS})
+target_link_libraries(crocket_bench_h2o PRIVATE libh2o-evloop Threads::Threads)
 
 if(CROCKET_BUILD_TESTS)
   enable_testing()

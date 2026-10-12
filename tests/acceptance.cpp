@@ -12,6 +12,8 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <algorithm>
+#include <functional>
 
 using namespace crocket;
 
@@ -74,6 +76,9 @@ auto hello(std::string_view name, std::uint8_t age) -> std::string {
   return std::format("Hello, {} year old named {}!", age, name);
 }
 
+[[= http::get("/scale/{f}")]]
+auto scale(double f) -> std::string { return std::format("{}", f * 2); }
+
 [[= http::post("/users")]]
 auto create(Json<NewUser> body, Auth auth, State<Db> db) -> Result<Created<User>, ApiError> {
   ++g_create_calls;
@@ -116,6 +121,55 @@ auto redirect(Query<Target> q, Response& rs) -> void {
 [[= http::get("/boom")]]
 auto boom() -> std::string { throw std::runtime_error("secret database password in what()"); }
 
+struct Plan {
+  std::string name;
+  std::string api_token;
+  int seats;
+};
+
+[[= http::get("/logs")]]
+auto logs() -> std::string {
+  log::debug("not at level info {x}", 1);
+  log::info("created user {user_id} on plan {plan}", 42, std::string("pro"));
+  log::warn("login for {user} with {password}", std::string_view("ada"), "hunter2");
+  log::error("plan {details} and {{braces}}", Plan{"pro", "abc123", 5});
+  return "ok";
+}
+
+[[= http::get("/logs/thread")]]
+auto logs_thread() -> std::string {
+  auto ctx = log::context();
+  std::thread([ctx] {
+    log::Scope scope{ctx};
+    log::info("from a thread the handler started {n}", 1);
+  }).join();
+  return "ok";
+}
+
+[[= http::get("/logs/burst")]]
+auto logs_burst() -> std::string {
+  for (int i = 0; i < 50; ++i) log::info("line {i}", i);
+  return "ok";
+}
+
+[[= http::get("/doc")]]
+auto doc() -> Cacheable<std::string> {
+  using namespace std::chrono;
+  return {"0123456789", {.last_modified = sys_days(2026y / January / 2) + 3h, .ranges = true}};
+}
+
+[[= http::get("/doc.json")]]
+auto doc_json() -> Cacheable<std::vector<int>> { return Cacheable{std::vector{1, 2, 3}, {.ranges = true}}; }
+
+[[= http::get("/framed")]]
+auto framed(Response& rs) -> std::string {
+  rs.headers.set("x-frame-options", "SAMEORIGIN");
+  return "embeddable";
+}
+
+[[= http::get("/whoami")]]
+auto whoami(Client client) -> std::string { return client.addr + " " + std::string(client.scheme); }
+
 [[= http::del("/users/{id}")]]
 auto remove(std::uint64_t id, Auth auth) -> Result<void> {
   if (!auth.has_scope("admin")) return std::unexpected(ApiError::forbidden("auth.scope", "admin scope required"));
@@ -129,6 +183,11 @@ struct Page {
 };
 [[= http::get("/search")]]
 auto search(Query<Page> p) -> std::string { return std::format("page={} q={}", p->page, p->q.value_or("-")); }
+
+[[= http::get("/headers")]]
+auto headers(Header<"x-tenant"> tenant, Header<"X-Retry", std::optional<int>> retry) -> std::string {
+  return std::format("tenant={} retry={}", *tenant, retry->value_or(-1));
+}
 
 [[= http::get("/async/{n}")]]
 auto async_double(int n) -> Task<std::string> {
@@ -191,11 +250,15 @@ Authenticator test_auth() {
 struct LogCapture {
   std::shared_ptr<std::mutex> mu = std::make_shared<std::mutex>();
   std::shared_ptr<std::vector<std::string>> lines = std::make_shared<std::vector<std::string>>();
-  Logger logger() {
-    return Logger{[mu = mu, lines = lines](std::string_view l) {
+  std::function<void(std::string_view)> sink() {
+    return [mu = mu, lines = lines](std::string_view l) {
       std::lock_guard lk(*mu);
       lines->emplace_back(l);
-    }};
+    };
+  }
+  std::vector<std::string> all() const {
+    std::lock_guard lk(*mu);
+    return *lines;
   }
   std::string last() const {
     std::lock_guard lk(*mu);
@@ -246,9 +309,10 @@ auto bulk(Json<std::vector<Widget>> ws) -> std::string { return std::to_string(w
 
 bool contains(std::string_view hay, std::string_view needle) { return hay.find(needle) != std::string_view::npos; }
 
-App make_app(LogCapture& log, Metrics* metrics_out = nullptr, Config cfg = Config{.debug_routes = true}) {
-  App app{std::move(cfg)};
-  app.manage(Db{}).manage(test_auth()).manage(Greeter{"Hi"}).attach(log.logger());
+Crocket make_app(LogCapture& log, Metrics* metrics_out = nullptr, Config cfg = Config{.debug_routes = true}) {
+  if (!cfg.log.sink) cfg.log.sink = log.sink();
+  Crocket app{std::move(cfg)};
+  app.manage(Db{}).manage(test_auth()).manage(Greeter{"Hi"}).attach(Logger{});
   if (metrics_out) app.attach(*metrics_out);
   app.attach(Cors::allow_origins({"https://ok.example"}))
       .mount("/", reflect_routes<^^api>())
@@ -261,7 +325,7 @@ App make_app(LogCapture& log, Metrics* metrics_out = nullptr, Config cfg = Confi
 int main() {
   LogCapture log;
   Metrics metrics;
-  App app = make_app(log, &metrics);
+  Crocket app = make_app(log, &metrics);
   LocalClient client(app);
 
   section("1. hello(name, uint8_t age)");
@@ -292,7 +356,12 @@ int main() {
     CHECK(contains(bad_json.body, "malformed JSON"));
     auto wrong_shape = client.post("/users").bearer("alice").json(R"({"email": 7})").dispatch();
     CHECK_EQ(wrong_shape.status, 422);
-    CHECK(contains(wrong_shape.body, "field 'email'"));
+    CHECK(contains(wrong_shape.body, "field '/email': expected string, got number"));
+    CHECK(contains(wrong_shape.body, R"("errors":[{"pointer":"/email","detail":"expected string, got number"}])"));
+    // RFC 9457 problem details.
+    CHECK_EQ(*wrong_shape.headers.get("content-type"), std::string_view("application/problem+json"));
+    CHECK(contains(wrong_shape.body, R"({"title":"Unprocessable Content","status":422,"detail":)"));
+    CHECK(contains(wrong_shape.body, R"("code":"json.invalid")"));
     auto no_auth = client.post("/users").json(R"({"email":"a@b.c"})").dispatch();
     CHECK_EQ(no_auth.status, 401);
     CHECK_EQ(no_auth.error_code, std::string_view("auth.missing"));
@@ -333,7 +402,7 @@ int main() {
 
   section("6. missing .manage(Db) fails ignite");
   {
-    App bare;
+    Crocket bare;
     bare.mount("/", reflect_routes<^^other>());
     auto ig = bare.ignite();
     CHECK(!ig.has_value());
@@ -341,11 +410,11 @@ int main() {
       CHECK(contains(ig.error().message(), "State<Db>"));
       CHECK(contains(ig.error().message(), "other::needs_db"));
     }
-    App fixed;
+    Crocket fixed;
     fixed.manage(Db{}).mount("/", reflect_routes<^^other>());
     CHECK(fixed.ignite().has_value());
     // Auth needs a managed Authenticator, checked the same way.
-    App no_auth;
+    Crocket no_auth;
     no_auth.manage(Db{}).manage(Greeter{"x"}).mount("/", reflect_routes<^^api>());
     auto ig2 = no_auth.ignite();
     CHECK(!ig2 && contains(ig2.error().message(), "State<crocket::Authenticator>"));
@@ -353,11 +422,11 @@ int main() {
 
   section("ignite: conflicting verb+path");
   {
-    App conflict;
+    Crocket conflict;
     conflict.mount("/", reflect_routes<^^dup>());
     auto ig = conflict.ignite();
     CHECK(!ig && contains(ig.error().message(), "route conflict"));
-    App twice;
+    Crocket twice;
     twice.mount("/", reflect_routes<^^other>()).mount("/", reflect_routes<^^other>()).manage(Db{});
     CHECK(!twice.ignite());
   }
@@ -401,6 +470,20 @@ int main() {
     CHECK_EQ(bad.error_code, std::string_view("query.invalid"));
   }
 
+  section("header extractor");
+  {
+    CHECK_EQ(client.get("/headers").header("X-Tenant", "acme").dispatch().body, std::string("tenant=acme retry=-1"));
+    CHECK_EQ(client.get("/headers").header("x-tenant", "acme").header("x-retry", "3").dispatch().body,
+             std::string("tenant=acme retry=3"));
+    auto missing = client.get("/headers").dispatch();
+    CHECK_EQ(missing.status, 400);
+    CHECK_EQ(missing.error_code, std::string_view("header.missing"));
+    CHECK(contains(missing.body, "x-tenant"));
+    auto bad = client.get("/headers").header("x-tenant", "acme").header("x-retry", "soon").dispatch();
+    CHECK_EQ(bad.status, 400);
+    CHECK_EQ(bad.error_code, std::string_view("header.invalid"));
+  }
+
   section("errors: uncaught exception never leaks what()");
   {
     auto r = client.get("/boom").dispatch();
@@ -428,7 +511,8 @@ int main() {
     (void)client.get("/hello/Ada/36").dispatch();
     auto line = log.last();
     for (auto key : {R"("method":"GET")", R"("route":"/hello/{name}/{age}")", R"("status":200)",
-                     R"("code":"")", R"("duration_ms":)", R"("bytes":29)", R"("id":")"})
+                     R"("code":"")", R"("duration_ms":)", R"("bytes_in":0)", R"("bytes_out":29)",
+                     R"("request_id":")", R"("msg":"request")"})
       CHECK(contains(line, key));
     CHECK(!contains(line, "Ada"));  // route template, not the raw path
   }
@@ -448,7 +532,7 @@ int main() {
     CHECK(contains(routes.body, R"("handler":"api::create")"));
     CHECK(contains(routes.body, R"({"name":"body","source":"json")"));
     CHECK(contains(routes.body, R"("rank":2)"));
-    App prod;
+    Crocket prod;
     LocalClient pc(prod);
     CHECK_EQ(pc.get("/__routes").dispatch().status, 404);  // debug-only
   }
@@ -473,7 +557,7 @@ int main() {
     auto foreign = client.get("/hello/a/1").header("origin", "https://evil.example").dispatch();
     CHECK(!foreign.headers.contains("access-control-allow-origin"));
 
-    App deny_app;
+    Crocket deny_app;
     deny_app.attach(Cors::deny()).mount("/", reflect_routes<^^other>()).manage(Db{});
     LocalClient dc(deny_app);
     auto d = dc.options("/needs-db").header("origin", "https://ok.example").header("access-control-request-method", "GET").dispatch();
@@ -486,6 +570,30 @@ int main() {
     CHECK_EQ(m.status, 200);
     CHECK(contains(m.body, R"(crocket_http_requests_total{method="GET",route="/hello/{name}/{age}",status="200"})"));
     CHECK(contains(m.body, R"(crocket_extractor_failures_total{route="/users",kind="json"})"));
+    // A method crocket does not know is "_OTHER": made-up methods cannot add series.
+    auto series = [&] {
+      auto body = client.get("/metrics").dispatch().body;
+      return std::ranges::count(body, '\n');
+    };
+    for (int i = 0; i < 1000; ++i) {
+      Request odd;
+      odd.method = http::Method::Unknown;
+      odd.method_text = std::format("JUNK{}", i);
+      odd.path = "/hello/Ada/36";
+      (void)app.handle(std::move(odd));
+    }
+    auto after_junk = series();
+    for (int i = 1000; i < 2000; ++i) {
+      Request odd;
+      odd.method = http::Method::Unknown;
+      odd.method_text = std::format("JUNK{}", i);
+      odd.path = "/hello/Ada/36";
+      (void)app.handle(std::move(odd));
+    }
+    CHECK_EQ(series(), after_junk);  // the same few _OTHER series, counted higher
+    auto mb = client.get("/metrics").dispatch().body;
+    CHECK(contains(mb, R"(crocket_http_requests_total{method="_OTHER",route="<unmatched>",status=")"));
+    CHECK(!contains(mb, "JUNK"));
     CHECK(contains(m.body, R"(crocket_extractor_failures_total{route="/users",kind="auth"})"));
     CHECK(contains(m.body, R"(crocket_extractor_failures_total{route="/hello/{name}/{age}",kind="path"})"));
     CHECK(contains(m.body, "crocket_http_requests_in_flight 1"));  // the scrape itself
@@ -553,7 +661,7 @@ int main() {
 
   section("json::from_path: one struct for POST and PUT");
   {
-    App rapp;
+    Crocket rapp;
     rapp.mount("/v1", reflect_routes<^^resources>());
     LocalClient rc(rapp);
     // POST: no {id} capture, so the server owns id.
@@ -601,25 +709,452 @@ int main() {
     CHECK(!probe.capture("id").has_value());
   }
 
+  section("trusted proxies: the client's address and scheme");
+  {
+    // Without trusted proxies, forwarding headers are ignored.
+    auto plain = client.get("/whoami").remote("10.0.0.5").header("x-forwarded-for", "1.2.3.4").dispatch();
+    CHECK_EQ(plain.body, std::string("10.0.0.5 http"));
+
+    LogCapture plog;
+    Crocket proxied = make_app(plog, nullptr, Config{.trusted_proxies = {"10.0.0.0/8", "fd00::/8"}});
+    LocalClient pc(proxied);
+    auto who = [&](std::string_view peer, std::vector<std::pair<std::string, std::string>> headers) {
+      auto call = pc.get("/whoami").remote(peer);
+      for (auto& [k, v] : headers) call.header(k, v);
+      return call.dispatch().body;
+    };
+    CHECK_EQ(who("10.0.0.5", {{"x-forwarded-for", "1.2.3.4"}}), std::string("1.2.3.4 http"));
+    CHECK_EQ(who("10.0.0.5", {{"x-forwarded-for", "1.2.3.4"}, {"x-forwarded-proto", "https"}}),
+             std::string("1.2.3.4 https"));
+    CHECK_EQ(who("fd00::1", {{"x-forwarded-for", "2001:db8::7"}}), std::string("2001:db8::7 http"));
+    CHECK_EQ(who("::ffff:10.0.0.5", {{"x-forwarded-for", "1.2.3.4"}}), std::string("1.2.3.4 http"));
+    // Two proxies: each trusted hop vouches for the one before it.
+    CHECK_EQ(who("10.0.0.5", {{"x-forwarded-for", "1.2.3.4, 10.0.0.7"}}), std::string("1.2.3.4 http"));
+    CHECK_EQ(who("10.0.0.5", {{"x-forwarded-for", "1.2.3.4"}, {"x-forwarded-for", "10.0.0.7"}}),
+             std::string("1.2.3.4 http"));
+    // A client cannot choose its own address: what it sent sits left of the real one.
+    CHECK_EQ(who("10.0.0.5", {{"x-forwarded-for", "6.6.6.6, 1.2.3.4"}}), std::string("1.2.3.4 http"));
+    // A peer that is not a trusted proxy is the client, whatever it sends.
+    CHECK_EQ(who("203.0.113.9", {{"x-forwarded-for", "1.2.3.4"}, {"x-forwarded-proto", "https"}}),
+             std::string("203.0.113.9 http"));
+    CHECK_EQ(who("10.0.0.5", {{"x-forwarded-for", "unknown"}}), std::string("10.0.0.5 http"));
+    CHECK_EQ(who("10.0.0.5", {{"x-forwarded-for", "1.2.3.4:5678"}}), std::string("1.2.3.4 http"));
+    CHECK_EQ(who("10.0.0.5", {{"x-forwarded-for", "[2001:db8::7]:443"}}), std::string("2001:db8::7 http"));
+    CHECK_EQ(who("10.0.0.5", {{"x-forwarded-proto", "javascript"}}), std::string("10.0.0.5 http"));
+    CHECK_EQ(who("10.0.0.5", {{"x-forwarded-proto", "https"}}), std::string("10.0.0.5 https"));  // scheme only
+    CHECK_EQ(who("203.0.113.9", {{"x-forwarded-proto", "https"}}), std::string("203.0.113.9 http"));
+    CHECK_EQ(who("10.0.0.5", {{"forwarded", "for=1.2.3.4"}}), std::string("10.0.0.5 http"));  // not the configured header
+
+    Crocket rfc = make_app(plog, nullptr,
+                           Config{.trusted_proxies = {"10.0.0.5"}, .proxy_header = ProxyHeader::Forwarded});
+    LocalClient rc(rfc);
+    auto fwd = [&](std::string_view value) {
+      return rc.get("/whoami").remote("10.0.0.5").header("forwarded", value).dispatch().body;
+    };
+    CHECK_EQ(fwd("for=192.0.2.60;proto=https"), std::string("192.0.2.60 https"));
+    CHECK_EQ(fwd(R"(For="[2001:db8:cafe::17]:4711";Proto=HTTPS)"), std::string("2001:db8:cafe::17 https"));
+    CHECK_EQ(fwd("for=6.6.6.6, for=192.0.2.60;proto=http;by=10.0.0.5"), std::string("192.0.2.60 http"));
+    CHECK_EQ(fwd("for=_hidden"), std::string("10.0.0.5 http"));
+    CHECK_EQ(fwd("proto=https"), std::string("10.0.0.5 https"));
+    CHECK_EQ(fwd("for=unknown;proto=https"), std::string("10.0.0.5 https"));
+    CHECK_EQ(rc.get("/whoami").remote("10.0.0.5").header("x-forwarded-for", "1.2.3.4").dispatch().body,
+             std::string("10.0.0.5 http"));
+
+    Crocket bad{Config{.trusted_proxies = {"10.0.0.0/33", "lb.internal"}}};
+    auto ig = bad.ignite();
+    CHECK(!ig && contains(ig.error().message(), R"(trusted_proxies entry "10.0.0.0/33" is not)"));
+    CHECK(!ig && contains(ig.error().message(), R"(trusted_proxies entry "lb.internal" is not)"));
+  }
+
+  section("allowed hosts");
+  {
+    LogCapture hlog;
+    Crocket hosted = make_app(hlog, nullptr, Config{.allowed_hosts = {"api.example.com", "*.example.org", "[::1]"}});
+    LocalClient hc(hosted);
+    auto status = [&](std::optional<std::string_view> host) {
+      auto call = hc.get("/healthz");
+      if (host) call.header("host", *host);
+      return call.dispatch();
+    };
+    for (auto ok : {"api.example.com", "API.Example.com:8443", "api.example.com.", "a.example.org", "a.b.example.org",
+                    "[::1]:8000"})
+      CHECK_EQ(status(ok).status, 200);
+    for (auto no : {"example.org", "evil.com", "api.example.com.evil.com", "xexample.org", "localhost", ""}) {
+      auto r = status(no);
+      CHECK_EQ(r.status, 400);
+      CHECK_EQ(r.error_code, std::string_view("host.invalid"));
+    }
+    CHECK_EQ(status(std::nullopt).status, 400);
+    CHECK(contains(hlog.last(), "host.invalid"));
+    // Every host is allowed when the list is empty.
+    CHECK_EQ(client.get("/healthz").header("host", "anything.test").dispatch().status, 200);
+    // The dev profile also answers on localhost.
+    Config dev = Config::dev();
+    dev.allowed_hosts = {"api.example.com"};
+    Crocket dev_hosted = make_app(hlog, nullptr, dev);
+    LocalClient dc(dev_hosted);
+    CHECK_EQ(dc.get("/healthz").header("host", "localhost:8000").dispatch().status, 200);
+    CHECK_EQ(dc.get("/healthz").header("host", "evil.com").dispatch().status, 400);
+
+    Crocket bad{Config{.allowed_hosts = {"https://api.example.com", "api.example.com:443", "*"}}};
+    auto ig = bad.ignite();
+    CHECK(!ig && contains(ig.error().message(), R"(allowed_hosts entry "https://api.example.com" is not a host name)"));
+    CHECK(!ig && contains(ig.error().message(), R"(allowed_hosts entry "api.example.com:443" has a port)"));
+    CHECK(!ig && !contains(ig.error().message(), R"(entry "*")"));
+  }
+
+  section("Shield: security headers by default");
+  {
+    auto r = client.get("/hello/Ada/36").dispatch();
+    CHECK_EQ(*r.headers.get("x-content-type-options"), std::string_view("nosniff"));
+    CHECK_EQ(*r.headers.get("x-frame-options"), std::string_view("DENY"));
+    CHECK_EQ(*r.headers.get("content-security-policy"), std::string_view("default-src 'none'; frame-ancestors 'none'"));
+    CHECK_EQ(*r.headers.get("referrer-policy"), std::string_view("no-referrer"));
+    CHECK(!r.headers.contains("strict-transport-security"));  // not https
+    CHECK(client.get("/nope").dispatch().headers.contains("x-content-type-options"));  // errors too
+    auto framed = client.get("/framed").dispatch();
+    CHECK_EQ(*framed.headers.get("x-frame-options"), std::string_view("SAMEORIGIN"));
+
+    LogCapture slog;
+    Crocket tls_app = make_app(slog, nullptr, Config{.trusted_proxies = {"10.0.0.5"}});
+    LocalClient tc(tls_app);
+    auto https = [&](std::string_view host) {
+      return tc.get("/healthz").remote("10.0.0.5").header("x-forwarded-proto", "https").header("host", host).dispatch();
+    };
+    auto secure = https("api.example.com");
+    CHECK_EQ(*secure.headers.get("strict-transport-security"), std::string_view("max-age=31536000"));
+    CHECK(!https("localhost:8443").headers.contains("strict-transport-security"));
+    CHECK(!https("127.0.0.1:8443").headers.contains("strict-transport-security"));
+
+    Crocket bare = make_app(slog);
+    bare.attach(Shield::none());
+    LocalClient bc(bare);
+    auto none = bc.get("/healthz").dispatch();
+    CHECK(!none.headers.contains("x-content-type-options") && !none.headers.contains("content-security-policy"));
+
+    Crocket custom = make_app(slog);
+    custom.attach(Shield{}.set("Content-Security-Policy", "default-src 'self'").remove("X-Frame-Options"));
+    LocalClient cc(custom);
+    auto c = cc.get("/healthz").dispatch();
+    CHECK_EQ(*c.headers.get("content-security-policy"), std::string_view("default-src 'self'"));
+    CHECK(!c.headers.contains("x-frame-options"));
+    CHECK(c.headers.contains("x-content-type-options"));
+
+    Crocket broken = make_app(slog);
+    broken.attach(Shield{}.set("x-bad", "a\r\nset-cookie: x"));
+    auto ig = broken.ignite();
+    CHECK(!ig && contains(ig.error().message(), "Shield: header 'x-bad'"));
+  }
+
+  section("paths: segments, dot segments, %2F and NUL, as the engine routes them");
+  {
+    auto name = [&](std::string_view target) {
+      auto r = client.get(target).dispatch();
+      return r.status == 200 ? r.body : std::to_string(r.status);
+    };
+    // %2F inside a capture is data: two segments, not three.
+    CHECK_EQ(name("/hello/a%2Fb/36"), std::string("Hello, 36 year old named a/b!"));
+    CHECK_EQ(name("/hello/..%2Fsecret/36"), std::string("Hello, 36 year old named ../secret!"));
+    CHECK_EQ(name("/hello/100%25/36"), std::string("Hello, 36 year old named 100%!"));
+    CHECK_EQ(name("/hello/a%2Fb%2Fc/36"), std::string("Hello, 36 year old named a/b/c!"));
+    // Dot segments are removed, encoded or not, and never climb above the root.
+    CHECK_EQ(name("/hello/Ada/../Bob/36"), std::string("Hello, 36 year old named Bob!"));
+    CHECK_EQ(name("/x/%2e%2E/hello/Ada/36"), std::string("Hello, 36 year old named Ada!"));
+    CHECK_EQ(name("/../../hello/./Ada/36"), std::string("Hello, 36 year old named Ada!"));
+    CHECK_EQ(name("/hello/a%00b/36"), std::string("400"));
+    CHECK_EQ(name("/hello/a%2Fb/../36"), std::string("404"));  // ".." takes off the "a%2Fb" segment
+    // The pieces themselves.
+    CHECK_EQ(*detail::normalize_path("/a/b%2Fc/%25"), std::string("/a/b%2Fc/%25"));
+    CHECK_EQ(*detail::normalize_path("/a/./b/.."), std::string("/a/"));
+    CHECK_EQ(*detail::normalize_path(""), std::string("/"));
+    CHECK_EQ(*detail::normalize_path("/plain/path"), std::string("/plain/path"));
+    CHECK(!detail::normalize_path("/a%00"));
+    std::vector<http::Segment> segs;
+    CHECK(contains(http::parse_template("/files/a%2Fb", segs), "'%'"));
+    CHECK(contains(http::parse_template("/files/../x", segs), "dot segment"));
+  }
+
+  section("path values: floats are finite");
+  {
+    CHECK_EQ(client.get("/scale/1.5").dispatch().body, std::string("3"));
+    for (auto bad : {"/scale/nan", "/scale/inf", "/scale/-infinity", "/scale/NaN"})
+      CHECK_EQ(client.get(bad).dispatch().status, 404);  // not a match for {f}, as "/scale/abc"
+  }
+
+  section("problem titles: every status has one");
+  {
+    for (int status : {400, 401, 403, 404, 405, 406, 408, 409, 410, 412, 413, 415, 416, 422, 429, 431, 500, 501, 502,
+                       503, 504, 206, 307, 308})
+      CHECK(!detail::reason_phrase(status).empty());
+    CHECK_EQ(detail::reason_phrase(416), std::string_view("Range Not Satisfiable"));
+    CHECK_EQ(detail::reason_phrase(431), std::string_view("Request Header Fields Too Large"));
+    CHECK_EQ(detail::reason_phrase(499), std::string_view("Client Error"));  // unlisted: its class
+    auto r = client.get("/hello/a/36").header("range", "bytes=0-1").dispatch();  // no ranges here: plain 200
+    CHECK_EQ(r.status, 200);
+  }
+
+  section("ETags: only for bodies up to etag_max_bytes");
+  {
+    LogCapture quiet;
+    Config small{.debug_routes = true};
+    small.etag_max_bytes = 16;
+    Crocket capped = make_app(quiet, nullptr, small);
+    LocalClient cc(capped);
+    auto big = cc.get("/hello/Ada/36").dispatch();  // 29 bytes
+    CHECK(big.status == 200 && !big.headers.contains("etag"));
+    CHECK_EQ(cc.get("/hello/Ada/36").header("if-none-match", "\"x\"").dispatch().status, 200);
+    auto small_body = cc.get("/scale/1").dispatch();  // "2"
+    CHECK(small_body.headers.contains("etag"));
+    Config off{.debug_routes = true};
+    off.etag_max_bytes = 0;
+    Crocket none = make_app(quiet, nullptr, off);
+    LocalClient nc(none);
+    CHECK(!nc.get("/scale/1").dispatch().headers.contains("etag"));
+  }
+
+  section("conditional requests: ETag and Last-Modified");
+  {
+    auto first = client.get("/hello/Ada/36").dispatch();
+    auto etag = std::string(first.headers.get("etag").value_or(""));
+    CHECK_EQ(etag.size(), std::size_t(18));  // a quoted 64-bit hash
+    CHECK(etag.starts_with('"') && etag.ends_with('"'));
+    CHECK_EQ(std::string(*client.get("/hello/Ada/36").dispatch().headers.get("etag")), etag);  // stable
+    CHECK(std::string(*client.get("/hello/Ada/37").dispatch().headers.get("etag")) != etag);
+    CHECK_EQ(std::string(*client.head("/hello/Ada/36").dispatch().headers.get("etag")), etag);
+
+    for (std::string inm : {etag, "W/" + etag, std::string("*"), "\"other\", " + etag}) {
+      auto r = client.get("/hello/Ada/36").header("if-none-match", inm).dispatch();
+      CHECK_EQ(r.status, 304);
+      CHECK(r.body.empty());
+      CHECK_EQ(std::string(*r.headers.get("etag")), etag);
+    }
+    CHECK_EQ(client.get("/hello/Ada/36").header("if-none-match", "\"other\"").dispatch().status, 200);
+    // Only successful GET and HEAD get one.
+    CHECK(!client.get("/nope").dispatch().headers.contains("etag"));
+    CHECK(!client.post("/users").bearer("alice").json(R"({"email":"a@b.c"})").dispatch().headers.contains("etag"));
+
+    auto doc = client.get("/doc").dispatch();
+    CHECK_EQ(*doc.headers.get("last-modified"), std::string_view("Fri, 02 Jan 2026 03:00:00 GMT"));
+    auto ims = [&](std::string_view since) { return client.get("/doc").header("if-modified-since", since).dispatch().status; };
+    CHECK_EQ(ims("Fri, 02 Jan 2026 03:00:00 GMT"), 304);
+    CHECK_EQ(ims("Sat, 03 Jan 2026 00:00:00 GMT"), 304);
+    CHECK_EQ(ims("Thu, 01 Jan 2026 00:00:00 GMT"), 200);
+    CHECK_EQ(ims("yesterday"), 200);
+    // If-None-Match wins over If-Modified-Since.
+    CHECK_EQ(client.get("/doc").header("if-none-match", "\"other\"")
+                 .header("if-modified-since", "Sat, 03 Jan 2026 00:00:00 GMT").dispatch().status, 200);
+
+    using namespace std::chrono;
+    CHECK_EQ(http::date(sys_days(1994y / November / 6) + 8h + 49min + 37s), std::string("Sun, 06 Nov 1994 08:49:37 GMT"));
+    CHECK(http::parse_date("Sun, 06 Nov 1994 08:49:37 GMT") == sys_days(1994y / November / 6) + 8h + 49min + 37s);
+    CHECK(!http::parse_date("Sun, 31 Feb 1994 08:49:37 GMT"));
+    CHECK(!http::parse_date("Sunday, 06-Nov-94 08:49:37 GMT"));
+  }
+
+  section("range requests");
+  {
+    auto range = [&](std::string_view r) { return client.get("/doc").header("range", r).dispatch(); };
+    auto part = range("bytes=2-4");
+    CHECK_EQ(part.status, 206);
+    CHECK_EQ(part.body, std::string("234"));
+    CHECK_EQ(*part.headers.get("content-range"), std::string_view("bytes 2-4/10"));
+    CHECK_EQ(range("bytes=7-").body, std::string("789"));
+    CHECK_EQ(range("bytes=-3").body, std::string("789"));
+    CHECK_EQ(range("bytes=8-100").body, std::string("89"));
+    auto whole = range("bytes=-20");
+    CHECK_EQ(*whole.headers.get("content-range"), std::string_view("bytes 0-9/10"));
+    auto past = range("bytes=10-");
+    CHECK_EQ(past.status, 416);
+    CHECK_EQ(past.error_code, std::string_view("range.unsatisfiable"));
+    CHECK_EQ(*past.headers.get("content-range"), std::string_view("bytes */10"));
+    CHECK_EQ(range("bytes=-0").status, 416);
+    // Any payload, JSON included.
+    auto json_part = client.get("/doc.json").header("range", "bytes=0-2").dispatch();
+    CHECK_EQ(json_part.status, 206);
+    CHECK_EQ(json_part.body, std::string("[1,"));
+    CHECK(!client.get("/doc.json").dispatch().headers.contains("last-modified"));
+    for (auto ignored : {"bytes=0-1,4-5", "bytes=5-2", "items=0-1", "bytes=x-y", "bytes=-"}) {
+      auto r = range(ignored);
+      CHECK_EQ(r.status, 200);
+      CHECK_EQ(r.body, std::string("0123456789"));
+    }
+    // Only for responses that say they accept ranges.
+    CHECK_EQ(client.get("/hello/Ada/36").header("range", "bytes=0-1").dispatch().status, 200);
+    // If-Range: a range of the copy the client has, else the whole new one.
+    auto etag = std::string(*client.get("/doc").dispatch().headers.get("etag"));
+    CHECK_EQ(client.get("/doc").header("range", "bytes=0-0").header("if-range", etag).dispatch().status, 206);
+    CHECK_EQ(client.get("/doc").header("range", "bytes=0-0").header("if-range", "\"stale\"").dispatch().status, 200);
+    CHECK_EQ(client.get("/doc").header("range", "bytes=0-0")
+                 .header("if-range", "Fri, 02 Jan 2026 03:00:00 GMT").dispatch().status, 206);
+    CHECK_EQ(client.get("/doc").header("range", "bytes=0-0")
+                 .header("if-range", "Thu, 01 Jan 2026 00:00:00 GMT").dispatch().status, 200);
+    // A fresh copy beats a range.
+    CHECK_EQ(client.get("/doc").header("range", "bytes=0-0").header("if-none-match", etag).dispatch().status, 304);
+  }
+
+  section("logging: message templates and request context");
+  {
+    LogCapture alog;
+    Crocket app2 = make_app(alog);
+    LocalClient c2(app2);
+    (void)c2.get("/logs").bearer("alice").header("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        .header("user-agent", "curl/8.5.0").remote("203.0.113.9").dispatch();
+    auto lines = alog.all();
+    auto find = [&](std::string_view needle) {
+      for (auto& l : lines)
+        if (contains(l, needle)) return l;
+      return std::string();
+    };
+    auto created = find("created user");
+    CHECK(contains(created, R"({"ts":")"));
+    CHECK(contains(created, R"("level":"info","msg":"created user 42 on plan pro","request_id":")"));
+    CHECK(contains(created, R"("trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","route":"/logs","handler":"api::logs")"));
+    CHECK(contains(created, R"("user_id":42,"plan":"pro"})"));
+    CHECK(find("not at level info").empty());
+    // Redaction: by field name, in the message too, and inside structs.
+    auto login = find("login for");
+    CHECK(contains(login, R"("msg":"login for ada with [redacted]")"));
+    CHECK(contains(login, R"("password":"[redacted]")"));
+    CHECK(!contains(login, "hunter2"));
+    auto plan = find("plan {");
+    CHECK(contains(plan, R"("level":"error")"));
+    CHECK(contains(plan, R"("details":{"name":"pro","api_token":"[redacted]","seats":5})"));
+    CHECK(contains(plan, R"(and {braces})"));
+    CHECK(!contains(plan, "abc123"));
+    // The request line has the new fields.
+    auto req = find(R"("msg":"request")");
+    for (auto key : {R"("trace_id":"4bf92f3577b34da6a3ce929d0e0e4736")", R"("client":"203.0.113.9")",
+                     R"("user_agent":"curl/8.5.0")", R"("route":"/logs")"})
+      CHECK(contains(req, key));
+    // A handler's own thread, given the context.
+    (void)c2.get("/logs/thread").dispatch();
+    lines = alog.all();
+    CHECK(contains(find("from a thread"), R"("route":"/logs/thread")"));
+    // The authenticated subject.
+    (void)c2.post("/users").bearer("alice").json(R"({"email":"a@b.c"})").dispatch();
+    CHECK(contains(alog.last(), R"("subject":"alice")"));
+    // A malformed traceparent is ignored.
+    (void)c2.get("/healthz").header("traceparent", "00-00000000000000000000000000000000-00f067aa0ba902b7-01").dispatch();
+    CHECK(!contains(alog.last(), "trace_id"));
+    // Outside a request: the last app to ignite, with no request fields.
+    log::info("background job {job} finished", std::string_view("reindex"));
+    app2.flush_logs();
+    CHECK(contains(alog.last(), R"("msg":"background job reindex finished")"));
+    CHECK(!contains(alog.last(), "request_id"));
+    // Many threads: every line arrives, in the order the lines were logged.
+    {
+      std::mutex turn;
+      int next = 0;
+      std::vector<std::thread> loggers;
+      for (int t = 0; t < 8; ++t)
+        loggers.emplace_back([&] {
+          for (int i = 0; i < 500; ++i) {
+            std::lock_guard lk(turn);
+            log::info("ordered {n}", next++);
+          }
+        });
+      for (auto& t : loggers) t.join();
+      app2.flush_logs();
+      int seen = 0;
+      bool in_order = true;
+      constexpr std::string_view needle = R"("msg":"ordered )";
+      for (auto& l : alog.all())
+        if (auto at = l.find(needle); at != l.npos) in_order &= std::stoi(l.substr(at + needle.size())) == seen++;
+      CHECK_EQ(seen, 4000);
+      CHECK(in_order);
+    }
+  }
+
+  section("logging: level, sampling and a full buffer");
+  {
+    LogCapture quiet;
+    Config warn_only;
+    warn_only.log.level = log::Level::warn;
+    Crocket qa = make_app(quiet, nullptr, warn_only);
+    LocalClient qc(qa);
+    (void)qc.get("/healthz").dispatch();
+    (void)qc.get("/logs").dispatch();
+    (void)qc.get("/nope").dispatch();
+    auto lines = quiet.all();
+    CHECK(std::ranges::none_of(lines, [](auto& l) { return contains(l, R"("status":200)"); }));
+    CHECK(std::ranges::any_of(lines, [](auto& l) { return contains(l, R"("status":404)"); }));
+    CHECK(std::ranges::any_of(lines, [](auto& l) { return contains(l, "login for"); }));  // warn
+    CHECK(std::ranges::none_of(lines, [](auto& l) { return contains(l, "created user"); }));  // info
+
+    LogCapture sampled;
+    Config none;
+    none.log.sample = 0;
+    Crocket sa = make_app(sampled, nullptr, none);
+    LocalClient sc(sa);
+    for (int i = 0; i < 20; ++i) (void)sc.get("/healthz").dispatch();
+    (void)sc.get("/nope").dispatch();
+    lines = sampled.all();
+    CHECK(std::ranges::none_of(lines, [](auto& l) { return contains(l, R"("status":200)"); }));
+    CHECK(std::ranges::any_of(lines, [](auto& l) { return contains(l, R"("status":404)"); }));  // errors always kept
+
+    auto slow = [](LogCapture& cap) {
+      return [inner = cap.sink()](std::string_view l) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        inner(l);
+      };
+    };
+    LogCapture dropping;
+    Config small;
+    small.log.buffer = 4;
+    Metrics dm;
+    Config small_slow = small;
+    small_slow.log.sink = slow(dropping);
+    Crocket db = make_app(dropping, &dm, small_slow);
+    LocalClient dc(db);
+    (void)dc.get("/logs/burst").dispatch();
+    lines = dropping.all();
+    auto kept = std::ranges::count_if(lines, [](auto& l) { return contains(l, R"("msg":"line )"); });
+    CHECK(kept < 50);
+    CHECK(std::ranges::any_of(lines, [](auto& l) { return contains(l, "log lines dropped"); }));
+    CHECK(contains(dm.render(), "crocket_log_lines_dropped_total "));
+    CHECK(!contains(dm.render(), "crocket_log_lines_dropped_total 0\n"));
+
+    LogCapture blocking;
+    Config wait = small;
+    wait.log.when_full = log::WhenFull::block;
+    wait.log.sink = slow(blocking);
+    Crocket ba = make_app(blocking, nullptr, wait);
+    LocalClient bc(ba);
+    (void)bc.get("/logs/burst").dispatch();
+    lines = blocking.all();
+    CHECK_EQ(std::ranges::count_if(lines, [](auto& l) { return contains(l, R"("msg":"line )"); }), 50);
+  }
+
+  section("logging: dev profile text");
+  {
+    LogCapture tlog;
+    Crocket ta = make_app(tlog, nullptr, Config::dev());
+    LocalClient tc(ta);
+    (void)tc.get("/logs").dispatch();
+    auto lines = tlog.all();
+    CHECK(std::ranges::any_of(lines, [](auto& l) { return contains(l, " DEBUG not at level info 1 ["); }));
+    CHECK(std::ranges::any_of(lines, [](auto& l) { return contains(l, " INFO  created user 42 on plan pro ["); }));
+  }
+
   section("dev profile: details in error bodies only in dev");
   {
     // Release (the app above): the detail is logged, never sent.
     for (auto path : {"/boom", "/hello/Ada/400"}) {
       auto r = client.get(path).dispatch();
       CHECK(r.status >= 400);
-      CHECK(!contains(r.body, R"("detail")"));
+      CHECK(!contains(r.body, R"("debug")"));
       CHECK(contains(log.last(), R"("detail":)"));
     }
     CHECK(Config{}.profile == Profile::Release);
 
     LogCapture dev_log;
-    App dev_app = make_app(dev_log, nullptr, Config::dev());
+    Crocket dev_app = make_app(dev_log, nullptr, Config::dev());
     LocalClient dev(dev_app);
     auto boom = dev.get("/boom").dispatch();
     CHECK_EQ(boom.status, 500);
-    CHECK(contains(boom.body, R"x("detail":"uncaught exception in api::boom: secret database password in what()")x"));
+    CHECK(contains(boom.body, R"x("debug":"uncaught exception in api::boom: secret database password in what()")x"));
     auto fwd = dev.get("/hello/Ada/400").dispatch();
-    CHECK(contains(fwd.body, R"("detail":"api::hello: capture '{age}' did not parse")"));
+    CHECK(contains(fwd.body, R"("debug":"api::hello: capture '{age}' did not parse")"));
 
     // Readable log lines, no JSON, no colour for a custom sink.
     auto line = dev_log.last();

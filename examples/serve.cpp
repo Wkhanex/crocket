@@ -4,6 +4,8 @@
 //   ./build/crocket_serve                                 # http://0.0.0.0:8000
 //   CROCKET_PORT=8443 CROCKET_TLS_CERT=cert.pem CROCKET_TLS_KEY=key.pem ./build/crocket_serve
 //   CROCKET_DEBUG_ROUTES=1 ./build/crocket_serve          # exposes GET /__routes
+//   CROCKET_WORKERS=2 ./build/crocket_serve                # handler threads (default: one per core)
+//   CROCKET_EVENT_LOOPS=4 ./build/crocket_serve            # network I/O threads (default: one per physical core)
 //
 //   curl localhost:8000/api/users/1
 //   curl -X POST localhost:8000/api/users -H 'authorization: Bearer alice' \
@@ -98,6 +100,7 @@ auto create(Json<NewUser> body, Auth auth, State<DbPool> db, Deadline d) -> Resu
   auto conn = db->checkout(d);
   if (!conn) return std::unexpected(conn.error());
   User u = (*conn)->insert(std::move(*body), auth.subject);
+  log::info("created user {user_id}", u.id);  // tagged with the request id, route and subject
   return Created<User>{u, "/api/users/" + std::to_string(u.id)};
 }
 
@@ -114,6 +117,28 @@ auto slow(std::uint32_t ms, Deadline d) -> Result<std::string, ApiError> {
   }
   return std::format("slept {} ms", ms);
 }
+
+/// What not to do: sleeps through its deadline, holding a worker all the while.
+/// Crocket answers 504 on time, counts the worker in crocket_workers_stuck, and
+/// warns when the handler finally returns.
+[[= http::get("/stubborn/{ms}")]]
+auto stubborn(std::uint32_t ms) -> std::string {
+  log::info("stubborn handler started");
+  std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+  return std::format("slept {} ms", ms);
+}
+
+// The same wait without holding a worker: the task suspends, and the worker
+// serves other requests until the timer (or the deadline) wakes it.
+[[= http::get("/nap/{ms}")]]
+auto nap(std::uint32_t ms, Deadline d) -> Task<std::string> {
+  co_await sleep_for(std::chrono::milliseconds(ms));
+  co_return d.expired() ? std::string("woken by the deadline") : std::format("napped {} ms", ms);
+}
+
+/// A custom request header, read the same way over HTTP/1.1 and HTTP/2.
+[[= http::get("/tenant")]]
+auto tenant(Header<"x-tenant"> tenant) -> std::string { return *tenant; }
 
 /// Async handler: same annotation, awaitable result.
 [[= http::get("/square/{n}")]]
@@ -156,22 +181,30 @@ int main() {
     cfg.request_timeout = 10s;
     cfg.drain_timeout = 5s;
   }
+  if (auto t = env("CROCKET_REQUEST_TIMEOUT"); !t.empty()) cfg.request_timeout = std::chrono::seconds(std::stoi(t));
   if (!env("CROCKET_DEBUG_ROUTES").empty()) cfg.debug_routes = true;
+  if (auto v = env("CROCKET_MAX_BODY_MEMORY"); !v.empty()) cfg.max_body_memory = std::stoull(v);
 
-  ListenOptions listen;
-  listen.host = env("CROCKET_HOST");  // empty: 0.0.0.0, or 127.0.0.1 in dev
-  listen.port = static_cast<std::uint16_t>(std::stoi(env("CROCKET_PORT", "8000")));
-  listen.tls_cert = env("CROCKET_TLS_CERT");
-  listen.tls_key = env("CROCKET_TLS_KEY");
+  LaunchOptions launch;
+  launch.host = env("CROCKET_HOST");  // empty: 0.0.0.0, or 127.0.0.1 in dev
+  launch.port = static_cast<std::uint16_t>(std::stoi(env("CROCKET_PORT", "8000")));
+  launch.tls_cert = env("CROCKET_TLS_CERT");
+  launch.tls_key = env("CROCKET_TLS_KEY");
+  if (auto w = env("CROCKET_WORKERS"); !w.empty()) launch.workers = unsigned(std::stoi(w));
+  if (auto l = env("CROCKET_EVENT_LOOPS"); !l.empty()) launch.event_loops = unsigned(std::stoi(l));
+  if (auto v = env("CROCKET_MAX_CONNECTIONS"); !v.empty()) launch.max_connections = unsigned(std::stoul(v));
+  if (auto v = env("CROCKET_MAX_CONNECTIONS_PER_IP"); !v.empty()) launch.max_connections_per_ip = unsigned(std::stoul(v));
+  if (auto v = env("CROCKET_HTTP2_MAX_STREAMS"); !v.empty()) launch.http2_max_streams = unsigned(std::stoul(v));
 
-  return App{cfg}
+  return build(cfg)
       .manage(std::move(pool))  // Pool::ready() also drives GET /readyz
       .manage(std::move(auth))
       .manage(Info{"crocket-serve 0.1.0"})
       .attach(Logger{})
       .attach(Cors::allow_origins({"https://app.example.com"}))
       .attach(Metrics{})
+      .attach(OpenApi{{.title = "crocket-serve", .version = "0.1.0", .docs = "/docs"}})  // GET /openapi.json, /docs
       .mount("/api", reflect_routes<^^api>())
       .mount("/", reflect_routes<^^Info>())
-      .listen(listen);
+      .launch(launch);
 }

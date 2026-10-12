@@ -27,10 +27,17 @@ wait_up() { # url
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=localhost" \
   -keyout "$WORK/key.pem" -out "$WORK/cert.pem" >/dev/null 2>&1 || { echo "openssl failed"; exit 1; }
 
-CROCKET_PORT=$PORT CROCKET_TLS_CERT="$WORK/cert.pem" CROCKET_TLS_KEY="$WORK/key.pem" \
+# A 15 s deadline leaves room for the 11 s handler below.
+CROCKET_PORT=$PORT CROCKET_TLS_CERT="$WORK/cert.pem" CROCKET_TLS_KEY="$WORK/key.pem" CROCKET_REQUEST_TIMEOUT=15 CROCKET_WORKERS=2 CROCKET_DEBUG_ROUTES=1 \
   "$SERVE" >"$WORK/serve.log" 2>&1 &
 SRV_PID=$!
 wait_up "$BASE/healthz" || { echo "server did not start"; cat "$WORK/serve.log"; exit 1; }
+
+# Each event loop listens with SO_REUSEPORT; a second server on the same port
+# must still be refused, not quietly handed a share of the connections.
+second=$(CROCKET_PORT=$PORT CROCKET_TLS_CERT="$WORK/cert.pem" CROCKET_TLS_KEY="$WORK/key.pem" "$SERVE" 2>&1)
+expect "a second server on the port exits 1" "1" "$?"
+expect_match "  ... saying why" "address already in use" "$second"
 
 echo "[TLS + ALPN]"
 expect "h2 negotiated when offered" "2" "$(curl -sk --http2 -o /dev/null -w '%{http_version}' "$BASE/healthz")"
@@ -57,7 +64,7 @@ for proto in --http2 --http1.1; do
   expect "missing user -> 404" "404" "$(curl -sk $proto -o /dev/null -w '%{http_code}' "$BASE/api/users/999")"
   expect "async handler" "49" "$(curl -sk $proto "$BASE/api/square/7")"
   expect "controller" "crocket-serve 0.1.0" "$(curl -sk $proto "$BASE/version")"
-  h=$(curl -sk $proto -I "$BASE/version" | tr -d '\r')
+  h=$(curl -sk $proto -I "$BASE/version" | tr -d '\r' | tr 'A-Z' 'a-z')  # h1 header names may be capitalised
   expect_match "HEAD -> 200 with content-length" "content-length: 19" "$h"
   expect "405 for wrong verb" "405" "$(curl -sk $proto -o /dev/null -w '%{http_code}' -X DELETE "$BASE/version")"
   gen=$(curl -sk $proto -D - -o /dev/null "$BASE/healthz" | tr -d '\r' | sed -n 's/^x-request-id: //p')
@@ -66,13 +73,164 @@ for proto in --http2 --http1.1; do
   expect "body over limit -> 413" "413" "$(printf '%s' "$big" | curl -sk $proto -o /dev/null -w '%{http_code}' \
         -X POST "$BASE/api/users" -H 'content-type: application/json' --data-binary @-)"
   expect "query + metrics" "200" "$(curl -sk $proto -o /dev/null -w '%{http_code}' "$BASE/metrics?x=1")"
+
+  # Headers the HTTP layer has no special name for must reach handlers on both protocols.
+  expect "custom request header" "acme" "$(curl -sk $proto -H 'x-tenant: acme' "$BASE/api/tenant")"
+  rid=$(curl -sk $proto -D - -o /dev/null -H 'x-request-id: trace-456' "$BASE/healthz" | tr -d '\r' |
+        sed -n 's/^x-request-id: //Ip')
+  expect "X-Request-Id honoured" "trace-456" "$rid"
+  h=$(curl -sk $proto -D - -o /dev/null -X OPTIONS "$BASE/api/users" -H 'origin: https://app.example.com' \
+      -H 'access-control-request-method: POST' -H 'access-control-request-headers: content-type' |
+      tr -d '\r' | tr 'A-Z' 'a-z')
+  expect_match "CORS preflight -> 204" "^http/[0-9.]+ 204" "$h"
+  expect_match "CORS preflight allows the origin" "access-control-allow-origin: https://app.example.com" "$h"
+  expect "CORS preflight from an unknown origin -> 403" "403" \
+    "$(curl -sk $proto -o /dev/null -w '%{http_code}' -X OPTIONS "$BASE/api/users" -H 'origin: https://evil.example' \
+       -H 'access-control-request-method: POST')"
+  expect "oversized headers -> 431" "431" \
+    "$(curl -sk $proto -o /dev/null -w '%{http_code}' -H "x-big: $(head -c 9000 /dev/zero | tr '\0' b)" "$BASE/healthz")"
+  etag=$(curl -sk $proto -D - -o /dev/null "$BASE/healthz" | tr -d '\r' | sed -n 's/^etag: //p')
+  expect "If-None-Match -> 304 with no body" "304 0" \
+    "$(curl -sk $proto --max-time 5 -o /dev/null -w '%{http_code} %{size_download}' -H "if-none-match: $etag" "$BASE/healthz")"
+  expect_match "security headers" "x-content-type-options: nosniff" "$(curl -sk $proto -D - -o /dev/null "$BASE/healthz")"
+  expect "too many headers -> 431" "431" \
+    "$(for i in $(seq 1 110); do echo "x-h$i: v"; done | curl -sk $proto -o /dev/null -w '%{http_code}' -H @- "$BASE/healthz")"
+done
+
+echo "[async handlers]"
+# 2 workers, 20 requests that each wait 500 ms: a blocking handler needs 5 s,
+# a suspended one frees its worker, so all 20 finish in about 0.5 s.
+start=$(date +%s%N)
+naps=()
+for i in $(seq 20); do curl -sk -o "$WORK/nap.$i" "$BASE/api/nap/500" & naps+=($!); done
+wait "${naps[@]}"  # not a bare wait: the server runs in the background too
+took=$(( ($(date +%s%N) - start) / 1000000 ))
+expect "20 suspended handlers on 2 workers" "20" "$(cat "$WORK"/nap.* | grep -o 'napped 500 ms' | wc -l | tr -d ' ')"
+expect_match "  ... at the same time (${took} ms)" "^yes$" "$( ((took < 2500)) && echo yes || echo no)"
+# Async handlers run on the event loops: with both workers blocked, they still answer.
+slows=()
+for i in 1 2; do curl -sk -o /dev/null "$BASE/api/slow/2000" & slows+=($!); done
+sleep 0.3
+start=$(date +%s%N)
+naps=()
+for i in $(seq 20); do curl -sk -o "$WORK/busy.$i" "$BASE/api/nap/100" & naps+=($!); done
+wait "${naps[@]}"
+took=$(( ($(date +%s%N) - start) / 1000000 ))
+expect "async handlers while every worker blocks" "20" "$(cat "$WORK"/busy.* | grep -o 'napped 100 ms' | wc -l | tr -d ' ')"
+expect_match "  ... without waiting for a worker (${took} ms)" "^yes$" "$( ((took < 1000)) && echo yes || echo no)"
+wait "${slows[@]}"
+expect "a deadline wakes a sleeping task: 504" "504" \
+  "$(curl -sk -o /dev/null -w '%{http_code}' -H 'grpc-timeout: 200m' "$BASE/api/nap/5000")"
+expect "the server is free again" "napped 1 ms" "$(curl -sk "$BASE/api/nap/1")"
+
+echo "[dead work]"
+# Both workers sleep through a 300 ms deadline; three requests queued behind
+# them time out before a worker is free, and their handler never runs.
+metric() { curl -sk "$BASE/metrics" | grep "^$1 " | cut -d' ' -f2; }
+abandoned=$(metric crocket_requests_abandoned_total)
+stubs=()
+for i in 1 2; do curl -sk -o /dev/null -H 'grpc-timeout: 300m' "$BASE/api/stubborn/1500" & stubs+=($!); done
+sleep 0.2
+queued=()
+for i in 1 2 3; do curl -sk -o /dev/null -w '%{http_code}' -H 'grpc-timeout: 300m' "$BASE/api/stubborn/10" >"$WORK/queued.$i" & queued+=($!); done
+wait "${queued[@]}"
+expect "requests still queued at their deadline: 504" "504504504" "$(cat "$WORK"/queued.* | grep -o '504' | tr -d '\n')"
+expect "workers past their request's deadline: crocket_workers_stuck" "2" "$(metric crocket_workers_stuck)"
+wait "${stubs[@]}"  # answered 504 at the deadline; the handlers sleep on
+sleep 1.5
+expect "  ... then free again" "0" "$(metric crocket_workers_stuck)"
+expect "the queued handlers never ran" "2" "$(grep -c 'stubborn handler started' "$WORK/serve.log")"
+expect "  ... counted in crocket_requests_abandoned_total" "3" "$(( $(metric crocket_requests_abandoned_total) - abandoned ))"
+expect "a handler that outlives its deadline is logged" "2" "$(grep -c "after its request's deadline" "$WORK/serve.log")"
+
+echo "[connection and body limits]"
+LPORT=18444
+LBASE="https://127.0.0.1:$LPORT"
+start_limited() { # env assignments
+  env CROCKET_PORT=$LPORT CROCKET_TLS_CERT="$WORK/cert.pem" CROCKET_TLS_KEY="$WORK/key.pem" CROCKET_EVENT_LOOPS=2 "$@" \
+    "$SERVE" >"$WORK/limited.log" 2>&1 &
+  LIM_PID=$!
+  wait_up "$LBASE/healthz" || { echo "limited server did not start"; cat "$WORK/limited.log"; }
+}
+stop_limited() { kill -INT $LIM_PID; wait $LIM_PID 2>/dev/null; }
+start_limited CROCKET_MAX_CONNECTIONS=3 CROCKET_HTTP2_MAX_STREAMS=7 CROCKET_MAX_BODY_MEMORY=65536
+# Three idle connections take every slot; the next waits in the accept queue.
+exec {c1}<>/dev/tcp/127.0.0.1/$LPORT {c2}<>/dev/tcp/127.0.0.1/$LPORT {c3}<>/dev/tcp/127.0.0.1/$LPORT
+sleep 0.3
+expect "at max_connections a new connection waits" "000" \
+  "$(curl -sk -o /dev/null -w '%{http_code}' --max-time 1 "$LBASE/healthz")"
+# (without copies of the held sockets, or closing them here would not close them)
+curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "$LBASE/healthz" >"$WORK/waited.code" {c1}>&- {c2}>&- {c3}>&- &
+WAITER=$!
+sleep 0.3
+exec {c1}>&-
+wait $WAITER
+expect "  ... and is served once one closes" "200" "$(cat "$WORK/waited.code")"
+exec {c2}>&- {c3}>&-
+sleep 0.3
+# The server's SETTINGS frame: SETTINGS_MAX_CONCURRENT_STREAMS (3) = 7.
+settings=$({ printf 'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00'; sleep 1; } |
+           timeout 5 openssl s_client -connect 127.0.0.1:$LPORT -alpn h2 -quiet 2>/dev/null | head -c 64 | od -An -tx1 | tr -d ' \n')
+expect_match "http2_max_streams is what SETTINGS advertises" "000300000007" "$settings"
+# max_body_memory (64 KiB): a body past it is 503, and what it held is freed.
+head -c 100000 /dev/zero | tr '\0' 'x' | sed 's/^/{"email":"/; s/$/"}/' >"$WORK/big.json"
+expect "bodies past max_body_memory: 503" "503" \
+  "$(curl -sk -o /dev/null -w '%{http_code}' -H 'content-type: application/json' --data-binary @"$WORK/big.json" "$LBASE/api/users")"
+expect "  ... then the memory is free again" "0" "$(curl -sk "$LBASE/metrics" | grep '^crocket_request_body_bytes ' | cut -d' ' -f2)"
+expect "  ... and a small body is taken (then Auth answers)" "401" \
+  "$(curl -sk -o /dev/null -w '%{http_code}' -H 'content-type: application/json' -d '{"email":"a@b.co"}' "$LBASE/api/users")"
+stop_limited
+start_limited CROCKET_MAX_CONNECTIONS_PER_IP=2
+exec {c1}<>/dev/tcp/127.0.0.1/$LPORT {c2}<>/dev/tcp/127.0.0.1/$LPORT
+sleep 0.3
+start=$(date +%s%N)
+code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 3 "$LBASE/healthz")
+took=$(( ($(date +%s%N) - start) / 1000000 ))
+expect_match "past max_connections_per_ip a connection is closed at once (${took} ms)" "^000 yes$" \
+  "$code $( ((took < 1500)) && echo yes || echo no)"
+exec {c1}>&- {c2}>&-
+sleep 0.3
+expect "  ... counted in crocket_connections_per_ip_closed_total" "1" \
+  "$(curl -sk "$LBASE/metrics" | grep '^crocket_connections_per_ip_closed_total ' | cut -d' ' -f2)"
+expect "  ... and served once the others close" "200" "$(curl -sk -o /dev/null -w '%{http_code}' "$LBASE/healthz")"
+stop_limited
+
+echo "[adaptive placement]"
+runs_on() { curl -sk "$BASE/__routes" | grep -o '"path":"/api/slow/{ms}","handler":"[^"]*","rank":[0-9-]*,"runs_on":"[^"]*"' | sed 's/.*"runs_on":"//; s/"$//'; }
+expect "a plain function starts on workers" "workers" "$(runs_on)"
+curl -sk -o /dev/null "$BASE/api/slow/0?n=[1-1100]"  # one connection, 1,100 fast runs
+expect "after 1,000 fast runs it runs on the event loops" "event loop" "$(runs_on)"
+grep -q 'api::slow runs on the event loops from now on' "$WORK/serve.log" && pass "  ... and says so" || fail "  ... and says so"
+expect "one slow run on a loop (the thread may just have been descheduled)" "slept 5 ms" "$(curl -sk "$BASE/api/slow/5")"
+expect "  ... leaves it there" "event loop" "$(runs_on)"
+curl -sk -o /dev/null "$BASE/api/slow/5?n=[1-8]"  # slow every time: it blocks
+expect "eight within a second move it back to workers" "workers" "$(runs_on)"
+grep -q 'api::slow blocked its event loop ([0-9]* ms, after 8 slow runs within 1 s)' "$WORK/serve.log" && pass "  ... and says why" || fail "  ... and says why"
+pool_runs_on() { curl -sk "$BASE/__routes" | grep -o '"path":"/api/users/{id}","handler":"[^"]*","rank":[0-9-]*,"runs_on":"[^"]*"' | sed 's/.*"runs_on":"//; s/"$//'; }
+curl -sk -o /dev/null "$BASE/api/users/1?n=[1-1100]"
+expect "a handler taking a Pool stays on workers however fast" "workers" "$(pool_runs_on)"
+
+echo "[http/1.1 bodies]"
+expect "chunked upload" "201" \
+  "$(printf '{"email":"chunked@example.com"}' | curl -sk --http1.1 -o /dev/null -w '%{http_code}' -X POST \
+     "$BASE/api/users" -H 'authorization: Bearer alice' -H 'content-type: application/json' \
+     -H 'transfer-encoding: chunked' --data-binary @-)"
+
+
+echo "[h2 bodies past the 64 KiB flow-control window]"
+name=$(head -c 300000 /dev/zero | tr '\0' n)
+printf '{"email":"big@example.com","name":"%s"}' "$name" >"$WORK/big.json"
+for how in "--data-binary @$WORK/big.json" "--data-binary @-"; do  # with, then without, Content-Length
+  size=$(curl -sk --http2 -o "$WORK/big.out" -w '%{http_code} %{size_download}' -X POST "$BASE/api/users" \
+         -H 'authorization: Bearer alice' -H 'content-type: application/json' $how <"$WORK/big.json")
+  expect_match "300 KB upload and echo ($([[ $how == *@- ]] && echo "no Content-Length" || echo "Content-Length"))" "^201 3000[0-9]{2}$" "$size"
 done
 
 echo "[h2 connection lifetime and concurrency]"
-# lws closes an h2 connection after keepalive_timeout (5 s) unless active
-# streams are marked immortal; a 6 s handler catches a regression.
-expect "h2 handler longer than lws keepalive" "200" \
-  "$(curl -sk --http2 -o /dev/null -w '%{http_code}' "$BASE/api/slow/6000")"
+# The h2 idle timeout (10 s) must not close a connection while a stream waits
+# on a handler; an 11 s handler catches a regression.
+expect "h2 handler longer than the idle timeout" "200" \
+  "$(curl -sk --http2 -o /dev/null -w '%{http_code}' "$BASE/api/slow/11000")"
 codes=$(for i in $(seq 1 20); do printf -- "-o /dev/null $BASE/api/slow/200 "; done |
         xargs curl -sk --http2 --parallel --parallel-max 20 -w '%{http_code}\n' | sort | uniq -c | xargs)
 expect "20 concurrent h2 streams" "20 200" "$codes"
@@ -83,10 +241,53 @@ echo "[request id propagation]"
 rid=$(curl -sk --http1.1 -D - -o /dev/null -H 'x-request-id: trace-123' "$BASE/healthz" | tr -d '\r' |
       sed -n 's/^x-request-id: //p')
 expect "X-Request-Id honoured over http/1.1" "trace-123" "$rid"
-grep -q '"id":"trace-123"' "$WORK/serve.log" && pass "request id in log line" || fail "request id in log line"
+grep -q '"request_id":"trace-123"' "$WORK/serve.log" && pass "request id in log line" || fail "request id in log line"
+grep -q '"msg":"created user [0-9]*","request_id":"[0-9a-f]*",.*"subject":"alice","user_id":' "$WORK/serve.log" \
+  && pass "handler log line carries the request" || fail "handler log line carries the request"
 grep -q '"route":"/api/users/{id}"' "$WORK/serve.log" && pass "log uses route template" || fail "log uses route template"
 curl -sk "$BASE/metrics" | grep -q 'route="/api/users/{id}"' && pass "metrics by route template" ||
   fail "metrics by route template"
+
+echo "[TLS certificate reload]"
+served_cert() { openssl s_client -connect "127.0.0.1:$PORT" -servername localhost </dev/null 2>/dev/null |
+                openssl x509 -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2; }
+file_cert() { openssl x509 -noout -fingerprint -sha256 -in "$1" | cut -d= -f2; }
+new_cert() { # dir
+  mkdir -p "$1"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=localhost" \
+    -keyout "$1/key.pem" -out "$1/cert.pem" >/dev/null 2>&1
+}
+expect "serving the certificate it started with" "$(file_cert "$WORK/cert.pem")" "$(served_cert)"
+# A request in flight across a reload keeps its connection.
+curl -sk -o /dev/null -w '%{http_code}' "$BASE/api/slow/2500" >"$WORK/across.code" &
+ACROSS_PID=$!
+sleep 0.3
+# Replaced in place, the way cert-manager and ACME clients do: picked up once
+# the files have settled, without a signal.
+new_cert "$WORK/r1"
+cp "$WORK/r1/key.pem" "$WORK/key.pem"
+cp "$WORK/r1/cert.pem" "$WORK/cert.pem"
+for _ in $(seq 1 40); do [[ "$(served_cert)" == "$(file_cert "$WORK/r1/cert.pem")" ]] && break; sleep 0.1; done
+expect "a replaced certificate file is picked up" "$(file_cert "$WORK/r1/cert.pem")" "$(served_cert)"
+grep -q 'TLS certificate reloaded (the certificate or key file changed)' "$WORK/serve.log" &&
+  pass "  ... and logged" || fail "  ... and logged"
+wait $ACROSS_PID
+expect "a request in flight across the reload completes" "200" "$(cat "$WORK/across.code")"
+# A broken certificate keeps the one being served.
+echo "not a certificate" >"$WORK/cert.pem"
+sleep 2.5
+expect "a broken certificate file keeps the previous one" "$(file_cert "$WORK/r1/cert.pem")" "$(served_cert)"
+grep -q 'TLS certificate not reloaded' "$WORK/serve.log" && pass "  ... and says why" || fail "  ... and says why"
+expect "  ... and keeps serving" "200" "$(curl -sk -o /dev/null -w '%{http_code}' "$BASE/healthz")"
+# SIGHUP reloads at once (the file watch waits for the files to settle).
+new_cert "$WORK/r2"
+cp "$WORK/r2/key.pem" "$WORK/key.pem"
+cp "$WORK/r2/cert.pem" "$WORK/cert.pem"
+kill -HUP $SRV_PID
+sleep 0.3
+expect "SIGHUP reloads it at once" "$(file_cert "$WORK/r2/cert.pem")" "$(served_cert)"
+grep -q 'TLS certificate reloaded (SIGHUP)' "$WORK/serve.log" && pass "  ... and logged" || fail "  ... and logged"
+expect "  ... and the server keeps running" "200" "$(curl -sk -o /dev/null -w '%{http_code}' "$BASE/healthz")"
 
 echo "[graceful shutdown]"
 curl -sk --http2 -o "$WORK/slow.out" -w '%{http_code}' "$BASE/api/slow/1500" >"$WORK/slow.code" &
@@ -109,6 +310,28 @@ wait_up "http://127.0.0.1:8000/" || fail "hello did not start"
 expect "hello" "Hello, 42 year old named Rocketeer!" "$(curl -s http://127.0.0.1:8000/hello/Rocketeer/42)"
 expect "age 400 -> 404" "404" "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/hello/Rocketeer/400)"
 expect "percent-decoded capture" "Hello, 36 year old named Ada L!" "$(curl -s 'http://127.0.0.1:8000/hello/Ada%20L/36')"
+# The engine routes the raw target as LocalClient does (normalize_path).
+expect "%2F in a capture is data, not a segment" "Hello, 36 year old named a/b!" \
+  "$(curl -s --path-as-is 'http://127.0.0.1:8000/hello/a%2Fb/36')"
+expect "  ... ..%2F too" "Hello, 36 year old named ../x!" "$(curl -s --path-as-is 'http://127.0.0.1:8000/hello/..%2Fx/36')"
+expect "dot segments are removed" "Hello, 36 year old named Bob!" \
+  "$(curl -s --path-as-is 'http://127.0.0.1:8000/hello/Ada/../Bob/36')"
+expect "  ... encoded ones too" "Hello, 36 year old named Ada!" \
+  "$(curl -s --path-as-is 'http://127.0.0.1:8000/x/%2e%2E/hello/Ada/36')"
+expect "a NUL in the path: 400" "400" \
+  "$(curl -s -o /dev/null -w '%{http_code}' --path-as-is 'http://127.0.0.1:8000/hello/a%00b/36')"
+# A 413 sent before the body is read leaves an http/1.1 connection usable: the
+# engine reads and drops the rest of the body. curl closes a connection after an
+# early response itself, so this speaks HTTP/1.1 over a plain socket.
+raw=$(exec 3<>/dev/tcp/127.0.0.1/8000
+      printf 'POST /hello/a/1 HTTP/1.1\r\nhost: x\r\ncontent-length: 1100000\r\n\r\n' >&3
+      head -c 1100000 /dev/zero >&3
+      printf 'GET /hello/Ada/36 HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n' >&3
+      timeout 5 cat <&3)
+expect_match "413, then the next request on the same connection" "413 .*Hello, 36 year old named Ada!" \
+  "$(tr -d '\r\n' <<<"$raw")"
+kill -HUP $HELLO_PID; sleep 0.2
+expect "SIGHUP without TLS changes nothing" "Hello, 42 year old named Rocketeer!" "$(curl -s http://127.0.0.1:8000/hello/Rocketeer/42)"
 kill -INT $HELLO_PID; wait $HELLO_PID
 expect "hello exits 0 on SIGINT" "0" "$?"
 

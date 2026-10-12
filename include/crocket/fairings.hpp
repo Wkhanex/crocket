@@ -13,30 +13,23 @@
 
 namespace crocket {
 
-/// One structured completion line per request (JSON), e.g.
-/// {"ts":"…","level":"info","msg":"request","id":"…","method":"GET",
-///  "route":"/hello/{name}/{age}","status":200,"code":"","duration_ms":0.41,
-///  "bytes":27,"proto":"h2"}
-/// ApiError::detail appears here (as "detail") and nowhere else.
-/// In the dev profile the line is readable text instead, coloured when it goes
-/// to a terminal and NO_COLOR is unset:
+/// One line per request, through Config::log (level, sampling, sink), e.g.
+///   {"ts":"…","level":"info","msg":"request","request_id":"…","trace_id":"…","method":"GET",
+///    "route":"/hello/{name}/{age}","handler":"api::hello","status":200,"code":"","duration_ms":0.41,
+///    "bytes_in":0,"bytes_out":27,"proto":"h2","client":"203.0.113.9","user_agent":"curl/8.5.0"}
+/// with "subject" once Auth has verified the caller, and ApiError::detail as
+/// "detail" (the only place it appears outside the dev profile). In the dev
+/// profile the line is readable text instead:
 ///   14:02:11.504 GET /hello/Ada/400 404 0.21ms api::hello path.invalid: capture '{age}' did not parse [id]
 /// Attach it first so on_response (reverse order) sees the final response.
 class Logger {
  public:
-  using Sink = std::function<void(std::string_view line)>;
-  Logger();                    // stderr
-  explicit Logger(Sink sink);  // e.g. capture in tests
-
   void on_ignite(Ignite& ig);
   void on_response(const Request& rq, Response& rs);
   void on_shutdown();
 
  private:
-  std::shared_ptr<Sink> sink_;
-  bool to_stderr_ = false;
-  bool text_ = false;    // dev profile
-  bool colour_ = false;  // text_ on a terminal
+  std::shared_ptr<log::detail::Hub> hub_;
 };
 
 /// CORS as a fairing. Default is deny: no cross-origin headers are ever
@@ -69,11 +62,40 @@ class Cors {
   std::chrono::seconds max_age_{600};
 };
 
+/// Security headers on every response, like Rocket's Shield. Crocket attaches
+/// Shield{} at ignite unless a Shield is already attached; attach
+/// Shield::none() to send none of them.
+///
+///   x-content-type-options: nosniff
+///   x-frame-options: DENY
+///   content-security-policy: default-src 'none'; frame-ancestors 'none'
+///   referrer-policy: no-referrer
+///   strict-transport-security: max-age=31536000   (https only, never for localhost)
+///
+/// A header the handler already set is left alone.
+class Shield {
+ public:
+  Shield();
+  static Shield none();
+  /// Sends `value` for header `name`, in place of the default if there is one.
+  Shield& set(std::string_view name, std::string value);
+  /// Stops sending header `name`.
+  Shield& remove(std::string_view name);
+
+  void on_ignite(Ignite& ig);
+  void on_response(const Request& rq, Response& rs);
+
+ private:
+  std::vector<std::pair<std::string, std::string>> headers_;
+};
+
 /// Prometheus metrics labelled by route template (never by raw path):
 ///   crocket_http_requests_total{method,route,status}
 ///   crocket_http_request_duration_seconds{method,route} (histogram)
 ///   crocket_http_requests_in_flight
 ///   crocket_extractor_failures_total{route,kind}
+///   crocket_workers, crocket_workers_busy, crocket_workers_stuck (past their request's deadline)
+///   crocket_requests_abandoned_total (the deadline passed, or the client left, before a worker took it)
 /// Served at GET `path` (default /metrics) from on_request.
 class Metrics {
  public:
@@ -91,5 +113,37 @@ class Metrics {
   std::string path_;
   std::shared_ptr<Store> store_;
 };
+
+/// The OpenAPI 3.1 description of the app's HTTP routes, generated from the
+/// handlers themselves: path captures, Query<T> and Header<...> parameters,
+/// Json<T> bodies, Auth, and what each handler returns, with JSON Schemas for
+/// the types as crocket reads and writes them. Served at GET `path`; with
+/// `docs` set, an interactive page (Swagger UI) there too.
+///
+///   app.attach(OpenApi{{.title = "Orders", .version = "1.4.0", .docs = "/docs"}});
+struct OpenApiOptions {
+  std::string title = "API";
+  std::string version = "0.1.0";
+  std::string description = {};
+  std::string path = "/openapi.json";
+  std::string docs = {};  // "/docs": Swagger UI, loaded from cdn.jsdelivr.net
+};
+class OpenApi {
+ public:
+  using Options = OpenApiOptions;
+  explicit OpenApi(Options o = {});
+
+  void on_ignite(Ignite& ig);
+  std::optional<Response> on_request(Request& rq);
+
+ private:
+  Options o_;
+  std::shared_ptr<const std::string> doc_;
+};
+
+/// The OpenAPI document for `app` (igniting it first), for writing openapi.json
+/// at build time or checking it into a repository:
+///   if (argv[1] == "--openapi"sv) { std::cout << crocket::openapi_document(app, {.title = "Orders"}); return 0; }
+std::string openapi_document(Crocket& app, const OpenApi::Options& o = {});
 
 }  // namespace crocket

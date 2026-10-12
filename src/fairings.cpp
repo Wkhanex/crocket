@@ -1,10 +1,13 @@
 #include "crocket/fairings.hpp"
+#include "crocket/grpc.hpp"
+#include "log_hub.hpp"
 #include "crocket/json.hpp"
 #include "crocket/responder.hpp"
 
 #include <unistd.h>
 
 #include <array>
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -18,12 +21,6 @@ namespace crocket {
 // ---- Logger -------------------------------------------------------------------
 
 namespace {
-void stderr_sink(std::string_view line) {
-  static std::mutex mu;
-  std::lock_guard lk(mu);
-  std::fwrite(line.data(), 1, line.size(), stderr);
-  std::fputc('\n', stderr);
-}
 void field(std::string& o, std::string_view k, std::string_view v) {
   o += ',';
   json::write_string(o, k);
@@ -31,82 +28,147 @@ void field(std::string& o, std::string_view k, std::string_view v) {
   json::write_string(o, v);
 }
 std::string line_start(std::string_view level, std::string_view msg) {
-  std::string o = R"({"ts":)";
-  json::write_string(o, detail::iso8601_now());
+  std::string o = R"({"ts":")";
+  detail::append_iso8601_now(o);
+  o += '"';
   field(o, "level", level);
   field(o, "msg", msg);
   return o;
 }
-}  // namespace
 
-Logger::Logger() : sink_(std::make_shared<Sink>(stderr_sink)), to_stderr_(true) {}
-Logger::Logger(Sink sink) : sink_(std::make_shared<Sink>(std::move(sink))) {}
-
-namespace {
-std::string local_time_now() {
-  auto now = std::chrono::system_clock::now();
-  auto t = std::chrono::system_clock::to_time_t(now);
-  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
-  std::tm tm{};
-  localtime_r(&t, &tm);
-  char buf[16];
-  std::snprintf(buf, sizeof buf, "%02d:%02d:%02d.%03d", tm.tm_hour, tm.tm_min, tm.tm_sec, int(ms));
-  return buf;
+// The request line is built once per request: constant keys go in as they are
+// (no escaping to do), values through the JSON escaper, numbers via to_chars.
+void key(std::string& o, std::string_view k) {  // `k` is ,"name":
+  o += k;
+}
+void value(std::string& o, std::string_view v) { json::write_string(o, v); }
+template <class N>
+void number(std::string& o, N n) {
+  char buf[32];
+  auto r = std::to_chars(buf, buf + sizeof buf, n);
+  o.append(buf, r.ptr);
 }
 }  // namespace
 
 void Logger::on_ignite(Ignite& ig) {
-  text_ = ig.config().profile == Profile::Dev;
-  if (text_) {  // listen() prints the route banner
-    const char* no_colour = std::getenv("NO_COLOR");
-    colour_ = to_stderr_ && isatty(STDERR_FILENO) && !(no_colour && *no_colour);
-    return;
-  }
-  auto o = line_start("info", "ignite");
-  o += R"(,"routes":)" + std::to_string(ig.routes().size()) + "}";
-  (*sink_)(o);
+  hub_ = ig.log_hub();
+  if (hub_->text() || !hub_->enabled(log::Level::info)) return;  // launch() prints the routes in dev
+  hub_->write(line_start("info", "ignite") + R"(,"routes":)" + std::to_string(ig.routes().size()) + "}");
 }
 
 void Logger::on_response(const Request& rq, Response& rs) {
+  if (!hub_) return;
+  auto level = rs.status >= 500 ? log::Level::error : rs.status >= 400 ? log::Level::warn : log::Level::info;
+  if (!hub_->enabled(level) || (rs.status < 400 && !hub_->sampled(rq.request_id))) return;
   auto dur = std::chrono::duration<double, std::milli>(Clock::now() - rq.received).count();
-  if (text_) {
+  if (hub_->text()) {
+    bool colour = hub_->colour();
     auto paint = [&](std::string_view code, std::string_view s) {
-      return colour_ ? std::format("\x1b[{}m{}\x1b[0m", code, s) : std::string(s);
+      return colour ? std::format("\x1b[{}m{}\x1b[0m", code, s) : std::string(s);
     };
     std::string_view hue = rs.status >= 500 ? "31" : rs.status >= 400 ? "33" : rs.status >= 300 ? "36" : "32";
-    auto o = std::format("{} {} {} {} {:.2f}ms", paint("2", local_time_now()), rq.method_text, rq.path,
+    auto o = std::format("{} {} {} {} {:.2f}ms", paint("2", log::detail::local_clock()), rq.method_text, rq.path,
                          paint(hue, std::to_string(rs.status)), dur);
     if (!rq.handler.empty()) o += std::format(" {}", rq.handler);
+    if (!rq.subject.empty()) o += std::format(" {}", paint("2", "as " + rq.subject));
     if (!rs.error_code.empty()) {
       auto what = rs.error_detail.empty() ? std::string(rs.error_code)
                                           : std::format("{}: {}", rs.error_code, rs.error_detail);
       o += std::format(" {} {}", paint(hue, what), paint("2", "[" + rq.request_id + "]"));
     }
-    (*sink_)(o);
+    hub_->write(std::move(o));
     return;
   }
-  std::string_view level = rs.status >= 500 ? "error" : rs.status >= 400 ? "warn" : "info";
-  auto o = line_start(level, "request");
-  field(o, "id", rq.request_id);
-  field(o, "method", rq.method_text);
-  field(o, "route", rq.route_template.empty() ? std::string_view("<unmatched>") : rq.route_template);
-  if (!rq.handler.empty()) field(o, "handler", rq.handler);
-  o += R"(,"status":)" + std::to_string(rs.status);
-  field(o, "code", rs.error_code);
+  constexpr std::string_view names[] = {R"(,"level":"debug")", R"(,"level":"info")", R"(,"level":"warn")",
+                                       R"(,"level":"error")"};
+  thread_local std::string o;  // reused: the hub copies the line, so nothing is allocated per request
+  o.clear();
+  o += R"({"ts":")";
+  detail::append_iso8601_now(o);
+  o += '"';
+  o += names[int(level)];
+  o += R"(,"msg":"request","request_id":)";
+  value(o, rq.request_id);
+  if (!rq.trace_id.empty()) key(o, R"(,"trace_id":)"), value(o, rq.trace_id);
+  key(o, R"(,"method":)"), value(o, rq.method_text);
+  key(o, R"(,"route":)"), value(o, rq.route_template.empty() ? std::string_view("<unmatched>") : rq.route_template);
+  if (!rq.handler.empty()) key(o, R"(,"handler":)"), value(o, rq.handler);
+  key(o, R"(,"status":)"), number(o, rs.status);
+  key(o, R"(,"code":)"), value(o, rs.error_code);
+  key(o, R"(,"duration_ms":)");
   char buf[32];
-  std::snprintf(buf, sizeof buf, "%.3f", dur);
-  o += R"(,"duration_ms":)";
-  o += buf;
-  o += R"(,"bytes":)" + std::to_string(rs.body.size());
-  field(o, "proto", rq.protocol);
-  if (!rs.error_detail.empty()) field(o, "detail", rs.error_detail);
+  auto r = std::to_chars(buf, buf + sizeof buf, dur, std::chars_format::fixed, 3);
+  o.append(buf, r.ptr);
+  key(o, R"(,"bytes_in":)"), number(o, rq.body.size());
+  key(o, R"(,"bytes_out":)"), number(o, rs.body.size());
+  key(o, R"(,"proto":)"), value(o, rq.protocol);
+  if (!rq.remote_addr.empty()) key(o, R"(,"client":)"), value(o, rq.remote_addr);
+  if (auto ua = rq.header("user-agent")) key(o, R"(,"user_agent":)"), value(o, ua->substr(0, 256));
+  if (!rq.subject.empty()) key(o, R"(,"subject":)"), value(o, rq.subject);
+  if (!rs.error_detail.empty()) key(o, R"(,"detail":)"), value(o, rs.error_detail);
   o += '}';
-  (*sink_)(o);
+  hub_->write(o);
 }
 
-void Logger::on_shutdown() { (*sink_)(text_ ? "shutdown" : line_start("info", "shutdown") + "}"); }
+void Logger::on_shutdown() {
+  if (!hub_) return;
+  if (hub_->enabled(log::Level::info)) hub_->write(hub_->text() ? "shutdown" : line_start("info", "shutdown") + "}");
+  hub_->flush();
+}
 
 // ---- Cors -----------------------------------------------------------------------
+
+// ---- Shield ----------------------------------------------------------------------
+
+Shield::Shield()
+    : headers_{{"x-content-type-options", "nosniff"},
+               {"x-frame-options", "DENY"},
+               {"content-security-policy", "default-src 'none'; frame-ancestors 'none'"},
+               {"referrer-policy", "no-referrer"},
+               {"strict-transport-security", "max-age=31536000"}} {}
+
+Shield Shield::none() {
+  Shield s;
+  s.headers_.clear();
+  return s;
+}
+
+Shield& Shield::set(std::string_view name, std::string value) {
+  remove(name);
+  std::string lower(name);
+  for (auto& c : lower)
+    if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+  headers_.emplace_back(std::move(lower), std::move(value));
+  return *this;
+}
+
+Shield& Shield::remove(std::string_view name) {
+  std::erase_if(headers_, [&](auto& h) { return Headers::iequals(h.first, name); });
+  return *this;
+}
+
+void Shield::on_ignite(Ignite& ig) {
+  for (auto& [k, v] : headers_)
+    if (!http::valid_header_name(k) || !http::valid_header_value(v))
+      ig.fail("Shield: header '" + k + "' has a name or value not allowed in HTTP headers");
+}
+
+void Shield::on_response(const Request& rq, Response& rs) {
+  if (auto ct = rs.headers.get("content-type"); ct && grpc::is_grpc_content_type(*ct)) return;
+  for (auto& [k, v] : headers_) {
+    if (rs.headers.contains(k)) continue;
+    if (k == "strict-transport-security") {
+      // Over plain http a browser ignores it; on localhost it would pin every
+      // local development server to https.
+      auto host = rq.header("host").value_or("");
+      bool local = host.starts_with("localhost") || host.starts_with("127.") || host.starts_with("[::1]");
+      if (rq.scheme != "https" || local) continue;
+    }
+    rs.headers.set(k, v);
+  }
+}
+
+// ---- Cors ----------------------------------------------------------------------
 
 Cors Cors::deny() { return Cors{}; }
 Cors Cors::allow_origins(std::vector<std::string> origins) {
@@ -206,22 +268,93 @@ namespace {
 constexpr std::array<double, 12> kBuckets{0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 10};
 }
 
+namespace {
+
+// Methods get a fixed label each; anything else a client sends is "_OTHER", so
+// made-up methods cannot add series without bound.
+constexpr std::size_t kMethods = 8;
+std::size_t method_index(http::Method m) {
+  return m == http::Method::Unknown ? kMethods - 1 : std::size_t(m);
+}
+std::string_view method_label(std::size_t i) {
+  return i == kMethods - 1 ? std::string_view("_OTHER") : http::method_name(http::Method(i));
+}
+
+std::atomic<std::uint64_t> g_next_store_id{1};
+
+/// A Prometheus label value, escaped.
+std::string label(std::string_view v) {
+  std::string o;
+  for (char c : v) {
+    if (c == '\\' || c == '"') o += '\\';
+    if (c == '\n') { o += "\\n"; continue; }
+    o += c;
+  }
+  return o;
+}
+
+}  // namespace
+
+/// Counters live in one shard per thread: a request touches only its own
+/// thread's, under a mutex no other request takes. render() adds them up.
 struct Metrics::Store {
-  struct Hist {
+  struct Series {  // one (route, method)
     std::array<std::uint64_t, kBuckets.size()> counts{};
     double sum = 0;
     std::uint64_t count = 0;
+    std::vector<std::pair<int, std::uint64_t>> statuses;  // usually one or two
   };
-  mutable std::mutex mu;
-  std::map<std::tuple<std::string, std::string, int>, std::uint64_t> requests;  // method, route, status
-  std::map<std::pair<std::string, std::string>, Hist> durations;               // method, route
-  std::map<std::pair<std::string, std::string>, std::uint64_t> failures;       // route, kind
+  struct Shard {
+    std::mutex mu;  // taken by its thread and by render(), never by other requests
+    std::vector<std::array<std::unique_ptr<Series>, kMethods>> slots;  // [route slot][method]
+    std::map<std::pair<std::size_t, std::string_view>, std::uint64_t> failures;  // slot, kind (static)
+  };
+
+  const std::uint64_t id = g_next_store_id.fetch_add(1);  // never reused, unlike an address
+  mutable std::mutex mu;  // the shard list and extra slots
+  std::vector<std::unique_ptr<Shard>> shards;
+  const RouteDef* routes = nullptr;  // slot i < n_routes is routes[i]
+  std::size_t n_routes = 0;          // slot n_routes is "<unmatched>"
+  std::vector<std::string> extra;    // later slots: templates a fairing set ("/metrics")
   const detail::Stats* stats = nullptr;
+
+  Shard& shard() {
+    // Per thread, the shard of each store this thread has recorded into.
+    thread_local std::vector<std::pair<std::uint64_t, Shard*>> mine;
+    for (auto& [store, sh] : mine)
+      if (store == id) return *sh;
+    std::lock_guard lk(mu);
+    shards.push_back(std::make_unique<Shard>());
+    if (mine.size() >= 16) mine.clear();  // entries of stores that are gone
+    mine.emplace_back(id, shards.back().get());
+    return *shards.back();
+  }
+
+  std::size_t slot_of(const Request& rq) {
+    if (rq.route && routes && rq.route >= routes && rq.route < routes + n_routes) return std::size_t(rq.route - routes);
+    if (rq.route_template.empty()) return n_routes;
+    std::lock_guard lk(mu);  // a template a fairing set: rare (a metrics scrape, say)
+    for (std::size_t i = 0; i < extra.size(); ++i)
+      if (extra[i] == rq.route_template) return n_routes + 1 + i;
+    extra.emplace_back(rq.route_template);
+    return n_routes + extra.size();
+  }
+
+  std::string slot_label(std::size_t slot) const {
+    if (slot < n_routes) return routes[slot].path;
+    if (slot == n_routes) return "<unmatched>";
+    return extra[slot - n_routes - 1];
+  }
 };
 
 Metrics::Metrics(std::string path) : path_(std::move(path)), store_(std::make_shared<Store>()) {}
 
-void Metrics::on_ignite(Ignite& ig) { store_->stats = &ig.stats(); }
+void Metrics::on_ignite(Ignite& ig) {
+  std::lock_guard lk(store_->mu);
+  store_->stats = &ig.stats();
+  store_->routes = ig.routes().data();
+  store_->n_routes = ig.routes().size();
+}
 
 std::optional<Response> Metrics::on_request(Request& rq) {
   if (rq.method != http::Method::Get || rq.path != path_) return std::nullopt;
@@ -233,40 +366,59 @@ std::optional<Response> Metrics::on_request(Request& rq) {
 }
 
 void Metrics::on_response(const Request& rq, Response& rs) {
-  std::string route = rq.route_template.empty() ? "<unmatched>" : std::string(rq.route_template);
   double secs = std::chrono::duration<double>(Clock::now() - rq.received).count();
-  std::lock_guard lk(store_->mu);
-  ++store_->requests[{rq.method_text, route, rs.status}];
-  auto& h = store_->durations[{rq.method_text, route}];
+  std::size_t slot = store_->slot_of(rq);
+  auto& sh = store_->shard();
+  std::lock_guard lk(sh.mu);
+  if (sh.slots.size() <= slot) sh.slots.resize(slot + 1);
+  auto& series = sh.slots[slot][method_index(rq.method)];
+  if (!series) series = std::make_unique<Store::Series>();
   for (std::size_t i = 0; i < kBuckets.size(); ++i)
-    if (secs <= kBuckets[i]) ++h.counts[i];
-  h.sum += secs;
-  ++h.count;
-  if (!rs.failure_kind.empty()) ++store_->failures[{route, std::string(rs.failure_kind)}];
+    if (secs <= kBuckets[i]) ++series->counts[i];
+  series->sum += secs;
+  ++series->count;
+  auto st = std::ranges::find(series->statuses, rs.status, &std::pair<int, std::uint64_t>::first);
+  if (st != series->statuses.end()) ++st->second;
+  else series->statuses.emplace_back(rs.status, 1);
+  if (!rs.failure_kind.empty()) ++sh.failures[{slot, rs.failure_kind}];
 }
-
-namespace {
-std::string label(std::string_view v) {
-  std::string o;
-  for (char c : v) {
-    if (c == '\\' || c == '"') o += '\\';
-    if (c == '\n') { o += "\\n"; continue; }
-    o += c;
-  }
-  return o;
-}
-}  // namespace
 
 std::string Metrics::render() const {
-  std::lock_guard lk(store_->mu);
+  // Add up every thread's shard, in the order the output has always had.
+  struct Hist {
+    std::array<std::uint64_t, kBuckets.size()> counts{};
+    double sum = 0;
+    std::uint64_t count = 0;
+  };
+  std::map<std::tuple<std::string, std::string, int>, std::uint64_t> requests;  // method, route, status
+  std::map<std::pair<std::string, std::string>, Hist> durations;               // method, route
+  std::map<std::pair<std::string, std::string>, std::uint64_t> failures;       // route, kind
+  {
+    std::lock_guard lk(store_->mu);
+    for (auto& shp : store_->shards) {
+      std::lock_guard slk(shp->mu);
+      for (std::size_t slot = 0; slot < shp->slots.size(); ++slot)
+        for (std::size_t m = 0; m < kMethods; ++m) {
+          auto& series = shp->slots[slot][m];
+          if (!series) continue;
+          std::string method(method_label(m)), route = store_->slot_label(slot);
+          for (auto& [status, n] : series->statuses) requests[{method, route, status}] += n;
+          auto& h = durations[{method, route}];
+          for (std::size_t i = 0; i < kBuckets.size(); ++i) h.counts[i] += series->counts[i];
+          h.sum += series->sum;
+          h.count += series->count;
+        }
+      for (auto& [k, n] : shp->failures) failures[{store_->slot_label(k.first), std::string(k.second)}] += n;
+    }
+  }
   std::string o;
   o += "# HELP crocket_http_requests_total Completed HTTP requests.\n# TYPE crocket_http_requests_total counter\n";
-  for (auto& [k, n] : store_->requests)
+  for (auto& [k, n] : requests)
     o += "crocket_http_requests_total{method=\"" + label(std::get<0>(k)) + "\",route=\"" + label(std::get<1>(k)) +
          "\",status=\"" + std::to_string(std::get<2>(k)) + "\"} " + std::to_string(n) + "\n";
   o += "# HELP crocket_http_request_duration_seconds Request duration.\n"
        "# TYPE crocket_http_request_duration_seconds histogram\n";
-  for (auto& [k, h] : store_->durations) {
+  for (auto& [k, h] : durations) {
     auto labels = "method=\"" + label(k.first) + "\",route=\"" + label(k.second) + "\"";
     for (std::size_t i = 0; i < kBuckets.size(); ++i) {
       char le[32];
@@ -283,9 +435,38 @@ std::string Metrics::render() const {
   o += "# HELP crocket_http_requests_in_flight Requests currently being handled.\n"
        "# TYPE crocket_http_requests_in_flight gauge\n";
   o += "crocket_http_requests_in_flight " + std::to_string(store_->stats ? store_->stats->in_flight.load() : 0) + "\n";
+  o += "# HELP crocket_log_lines_dropped_total Log lines discarded because the writer fell behind.\n"
+       "# TYPE crocket_log_lines_dropped_total counter\n";
+  o += "crocket_log_lines_dropped_total " + std::to_string(store_->stats ? store_->stats->log_dropped.load() : 0) + "\n";
+  if (const auto* st = store_->stats) {
+    unsigned n = st->workers.load(), busy = 0, stuck = 0;
+    auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
+    for (unsigned i = 0; i < n; ++i) {
+      auto deadline = st->worker_deadline[i].load(std::memory_order_relaxed);
+      if (deadline == 0) continue;
+      ++busy;
+      if (now > deadline) ++stuck;
+    }
+    o += "# HELP crocket_workers Handler threads.\n# TYPE crocket_workers gauge\ncrocket_workers " + std::to_string(n) + "\n";
+    o += "# HELP crocket_workers_busy Workers running a handler now.\n# TYPE crocket_workers_busy gauge\n"
+         "crocket_workers_busy " + std::to_string(busy) + "\n";
+    o += "# HELP crocket_workers_stuck Workers still running a handler after its request's deadline: it ignores "
+         "the deadline, and holds the worker.\n# TYPE crocket_workers_stuck gauge\ncrocket_workers_stuck " +
+         std::to_string(stuck) + "\n";
+    o += "# HELP crocket_requests_abandoned_total Requests whose handler never ran: the deadline passed, or the "
+         "client went away, while they waited for a worker.\n# TYPE crocket_requests_abandoned_total counter\n"
+         "crocket_requests_abandoned_total " + std::to_string(st->abandoned.load()) + "\n";
+    o += "# HELP crocket_connections Open connections (LaunchOptions::max_connections).\n"
+         "# TYPE crocket_connections gauge\ncrocket_connections " + std::to_string(st->connections.load()) + "\n";
+    o += "# HELP crocket_connections_per_ip_closed_total Connections closed on arrival: their address had "
+         "max_connections_per_ip open.\n# TYPE crocket_connections_per_ip_closed_total counter\n"
+         "crocket_connections_per_ip_closed_total " + std::to_string(st->connections_per_ip_closed.load()) + "\n";
+    o += "# HELP crocket_request_body_bytes Request bodies held in memory now (Config::max_body_memory).\n"
+         "# TYPE crocket_request_body_bytes gauge\ncrocket_request_body_bytes " + std::to_string(st->body_bytes.load()) + "\n";
+  }
   o += "# HELP crocket_extractor_failures_total Extractor failures by kind.\n"
        "# TYPE crocket_extractor_failures_total counter\n";
-  for (auto& [k, n] : store_->failures)
+  for (auto& [k, n] : failures)
     o += "crocket_extractor_failures_total{route=\"" + label(k.first) + "\",kind=\"" + label(k.second) + "\"} " +
          std::to_string(n) + "\n";
   return o;

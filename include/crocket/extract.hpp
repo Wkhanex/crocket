@@ -18,6 +18,7 @@
 #include "crocket/state.hpp"
 
 #include <charconv>
+#include <cmath>
 #include <concepts>
 #include <expected>
 #include <functional>
@@ -74,6 +75,7 @@ struct FromParam<T> {
     T v{};
     auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
     if (s.empty() || ec != std::errc() || p != s.data() + s.size()) return std::nullopt;
+    if (!std::isfinite(v)) return std::nullopt;  // from_chars takes "nan" and "inf"; a path or query value may not
     return v;
   }
 };
@@ -114,8 +116,11 @@ template <class T>
 struct FromRequest<State<T>> {
   static constexpr std::string_view kind = "state";
   static constexpr bool consumes_body = false;
+  /// A handler taking it may wait (a Pool's checkout): it stays on workers
+  /// (see Config::adaptive_placement). Types opt in with `crocket_may_block`.
+  static constexpr bool may_block = requires { T::crocket_may_block; };
   static std::expected<State<T>, ApiError> extract(Request& r) {
-    // Ignite guarantees presence; the null check guards misuse outside App.
+    // Ignite guarantees presence; the null check guards misuse outside Crocket.
     T* p = r.state_registry ? r.state_registry->template get<T>() : nullptr;
     if (!p) return std::unexpected(ApiError::internal("State<T> requested but not managed"));
     return State<T>(*p);
@@ -187,16 +192,23 @@ struct FromRequest<Json<T>> {
                                       "expected content-type application/json", std::string(*ct)});
     if (r.body.empty())
       return std::unexpected(ApiError::unprocessable("json.invalid", "request body is empty; expected JSON"));
-    auto doc = json::parse(r.body);
-    if (!doc)
-      return std::unexpected(ApiError::unprocessable(
-          "json.invalid", "malformed JSON at line " + std::to_string(doc.error().line) + ", column " +
-                              std::to_string(doc.error().column) + ": " + doc.error().message));
     Json<T> out{};
-    if (auto ok = json::decode(*doc, out.value); !ok)
-      return std::unexpected(ApiError::unprocessable("json.invalid", ok.error()));
+    if (auto ok = json::read(r.body, out.value, r.json_options); !ok) return std::unexpected(to_api_error(ok.error()));
     if (auto ok = detail::apply_from_path(r, out.value); !ok) return std::unexpected(std::move(ok.error()));
     return out;
+  }
+
+  static ApiError to_api_error(json::Error& e) {
+    using enum json::Errc;
+    std::string_view code = e.code == unknown_field   ? "json.unknown_field"
+                            : e.code == duplicate_key ? "json.duplicate_key"
+                            : e.code == limit         ? "json.limit_exceeded"
+                            : e.code == validation    ? "json.validation"
+                                                      : "json.invalid";
+    ApiError err = ApiError::unprocessable(code, e.describe());
+    if (e.code == validation) err.errors = std::move(e.errors);
+    else if (e.code != syntax) err.errors.push_back({std::move(e.pointer), std::move(e.message)});
+    return err;
   }
 };
 
@@ -237,7 +249,9 @@ struct FromRequest<Auth> {
       return std::unexpected(ApiError::unauthorized("auth.invalid", "authorization must use the Bearer scheme"));
     auto* verifier = r.state_registry ? r.state_registry->get<Authenticator>() : nullptr;
     if (!verifier) return std::unexpected(ApiError::internal("Auth used without a managed Authenticator"));
-    return verifier->verify(h->substr(scheme.size()));
+    auto auth = verifier->verify(h->substr(scheme.size()));
+    if (auth) r.subject = auth->subject;  // for log lines
+    return auth;
   }
   static void state_deps(std::vector<detail::StateDep>& out) { out.push_back(detail::state_dep<Authenticator>()); }
 };
@@ -261,6 +275,19 @@ struct FromRequest<RequestId> {
   static std::expected<RequestId, ApiError> extract(Request& r) { return RequestId{r.request_id}; }
 };
 
+/// The client: its address and the scheme it connected with, as trusted
+/// proxies report them (Config::trusted_proxies); otherwise the connection's.
+struct Client {
+  std::string addr;         // "203.0.113.9"
+  std::string_view scheme;  // "https" or "http"
+};
+template <>
+struct FromRequest<Client> {
+  static constexpr std::string_view kind = "client";
+  static constexpr bool consumes_body = false;
+  static std::expected<Client, ApiError> extract(Request& r) { return Client{r.remote_addr, r.scheme}; }
+};
+
 /// Query<T>: maps query parameters onto the public members of aggregate T by
 /// name. Members parse with FromParam; std::optional members may be absent.
 /// Failures are 422 query.invalid.
@@ -270,6 +297,77 @@ struct Query {
   T* operator->() { return &value; }
   const T* operator->() const { return &value; }
   T& operator*() { return value; }
+};
+
+/// A string literal as a template argument: Header<"x-api-key">.
+template <std::size_t N>
+struct FixedString {
+  char data[N]{};
+  consteval FixedString(const char (&s)[N]) {
+    for (std::size_t i = 0; i < N; ++i) data[i] = s[i];
+  }
+  [[nodiscard]] constexpr std::string_view view() const { return {data, N - 1}; }
+};
+
+namespace detail {
+consteval bool is_header_name(std::string_view s) {
+  if (s.empty()) return false;
+  for (char c : s) {  // RFC 9110 token characters
+    bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+              std::string_view("!#$%&'*+-.^_`|~").contains(c);
+    if (!ok) return false;
+  }
+  return true;
+}
+}  // namespace detail
+
+/// Header<"name", T>: the value of request header `name` (case-insensitive),
+/// parsed with FromParam<T>. T = std::optional<U> makes the header optional.
+/// A missing required header is 400 header.missing; a value that does not
+/// parse is 400 header.invalid.
+template <FixedString Name, class T = std::string>
+struct Header {
+  static_assert(detail::is_header_name(Name.view()), "crocket: Header<\"name\">: not a valid HTTP header name");
+  static constexpr std::string_view name = Name.view();
+
+  T value;
+  T* operator->() { return &value; }
+  const T* operator->() const { return &value; }
+  T& operator*() { return value; }
+  const T& operator*() const { return value; }
+};
+
+template <FixedString Name, class T>
+struct FromRequest<Header<Name, T>> {
+  static constexpr std::string_view kind = "header";
+  static constexpr bool consumes_body = false;
+  static std::expected<Header<Name, T>, ApiError> extract(Request& r) {
+    constexpr std::string_view name = Name.view();
+    auto raw = r.header(name);
+    if constexpr (json::is_optional<T>::value) {
+      using Inner = typename T::value_type;
+      static_assert(PathParam<Inner>, "Header<\"name\", T> type must be parseable with FromParam");
+      if (!raw) return Header<Name, T>{std::nullopt};
+      auto v = FromParam<Inner>::parse(*raw);
+      if (!v) return bad(*raw);
+      return Header<Name, T>{std::move(*v)};
+    } else {
+      static_assert(PathParam<T>, "Header<\"name\", T> type must be parseable with FromParam");
+      if (!raw)
+        return std::unexpected(
+            ApiError::bad_request("header.missing", "missing required header '" + std::string(name) + "'"));
+      auto v = FromParam<T>::parse(*raw);
+      if (!v) return bad(*raw);
+      return Header<Name, T>{std::move(*v)};
+    }
+  }
+
+ private:
+  static std::unexpected<ApiError> bad(std::string_view raw) {
+    return std::unexpected(ApiError{400, "header.invalid",
+                                    "header '" + std::string(Name.view()) + "' is not valid",
+                                    "value: '" + std::string(raw) + "'"});
+  }
 };
 
 template <class T>

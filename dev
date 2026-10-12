@@ -5,8 +5,8 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$ROOT"
 
-APT_PACKAGES=(g++-16 cmake ninja-build ccache lld libssl-dev pkg-config
-              git curl ca-certificates openssl gdb inotify-tools
+APT_PACKAGES=(g++-16 cmake ninja-build ccache lld libssl-dev zlib1g-dev perl pkg-config
+              git curl ca-certificates openssl gdb inotify-tools nghttp2-client
               make m4 bzip2 xz-utils file gpgv)   # the last line is for ./dev gcc
 GCC_VERSION=16.2.0
 WATCH_DIRS=(include src examples tests CMakeLists.txt)
@@ -33,6 +33,33 @@ ${B}./dev${R} <command> [args]
   check                     Release tree (build/, -O2) plus the full ctest: run
                             this before calling a change done
   clean [dev|release|all]   Delete build trees (default: dev)
+  bench [options] [load|micro] [scenario...]
+                            Benchmarks on the release tree: load (h2load against
+                            crocket_bench over http/1.1 and h2c) and micro (in-process
+                            timings and allocations). Both by default. Options:
+                              --save NAME     keep the results as bench/results/NAME.tsv
+                              --compare NAME  show the change from NAME; exits 1 if
+                                              anything is more than 10% worse
+                              --duration S    seconds per load run (default 10)
+                              --clients N     connections per load run (default 64)
+                              --threads N     h2load threads (default 8, 4 or 2 by cores)
+                              --realistic     attach Logger and Metrics to crocket_bench, as
+                                              a production app would
+                              --vs-rocket     also run Rocket 0.5 (bench/rocket) on the
+                                              same scenarios over HTTP/1.1; needs cargo
+                              --vs-h2o        also run h2o alone (bench/h2o.cpp), answering
+                                              from constants: the CPU crocket adds per
+                                              request, over HTTP/1.1 and h2c
+                            Numbers compare only on the same machine. h2load comes from
+                            nghttp2-client (./dev setup); $H2LOAD overrides the path.
+  fuzz [target|all] [--seconds N] [--save] [--replay FILE...]
+                            Fuzz the parsers of untrusted input (tests/fuzz: json,
+                            json_typed, proto, query, route, request, h2) with
+                            AddressSanitizer and coverage guidance, N seconds per
+                            target (default 60). --save adds inputs reaching new code
+                            to tests/fuzz/corpus. Crashes go to build-fuzz/crashes/
+  h2o-update [ref]          Pin h2o to the newest master commit (or a branch, tag
+                            or commit), then run ./dev check
 
 <target> is a CMake target; 'hello' and 'serve' are short for crocket_hello and
 crocket_serve. Examples:  ./dev watch hello     ./dev test -R compile_fail
@@ -94,7 +121,13 @@ need_tools() {
 # ---- builds ------------------------------------------------------------------
 
 # preset -> build directory (kept in sync with CMakePresets.json)
-tree() { [[ $1 == dev ]] && echo "$ROOT/build-dev" || echo "$ROOT/build"; }
+tree() {
+  case $1 in
+    dev) echo "$ROOT/build-dev" ;;
+    fuzz) echo "$ROOT/build-fuzz" ;;
+    *) echo "$ROOT/build" ;;
+  esac
+}
 
 configure() { # preset
   local dir; dir=$(tree "$1")
@@ -158,9 +191,330 @@ cmd_clean() {
   case ${1:-dev} in
     dev)     rm -rf "$ROOT/build-dev" "$ROOT/compile_commands.json" ;;
     release) rm -rf "$ROOT/build" ;;
-    all)     rm -rf "$ROOT/build-dev" "$ROOT/build" "$ROOT/compile_commands.json" ;;
+    all)     rm -rf "$ROOT/build-dev" "$ROOT/build" "$ROOT/build-fuzz" "$ROOT/compile_commands.json" ;;
     *)       die "usage: ./dev clean [dev|release|all]" ;;
   esac
+}
+
+# ---- bench -----------------------------------------------------------------------
+
+BENCH_PORT=18600
+ROCKET_BENCH_PORT=18601
+H2O_BENCH_PORT=18602
+# The scenarios bench/h2o.cpp answers (not the waits: there is no work to compare).
+H2O_SCENARIOS=(plaintext json orders router plaintext_async json_async orders_async router_async)
+# name method path [body]
+BENCH_SCENARIOS=(
+  "plaintext GET /plaintext"
+  "json GET /json"
+  "orders POST /orders body"
+  "router GET /api/v39/users/7/orders/9"
+  "wait GET /wait"
+  "wait_async GET /wait_async"
+  "plaintext_async GET /async/plaintext"
+  "json_async GET /async/json"
+  "orders_async POST /async/orders body"
+  "router_async GET /async/api/v39/users/7/orders/9"
+)
+
+bench_body() { # a 1 KB order for POST /orders
+  local items='' i
+  for i in 0 1 2 3 4 5 6 7; do
+    items+="${items:+,}{\"sku\":\"SKU-$((i * 7919))\",\"name\":\"Widget model $i\",\"qty\":$((i + 1)),\"price\":9.99}"
+  done
+  printf '{"id":1001,"email":"customer@example.com","tags":["priority","gift","eu"],"items":[%s]}' "$items"
+}
+
+# CPU time a process has used, user + kernel, all threads, in clock ticks.
+bench_ticks() { # pid
+  local stat; stat=$(cat "/proc/$1/stat" 2>/dev/null) || { echo 0; return; }
+  awk '{ print $12 + $13 }' <<<"${stat##*) }"  # fields after "pid (comm) ": utime is 12th, stime 13th
+}
+bench_now_ns() { date +%s%N; }
+
+# One h2load run -> rows "name.proto<TAB>metric<TAB>value<TAB>better" on stdout.
+#
+# Besides h2load's own numbers it measures the server's CPU time per request,
+# between two samples inside the run. That does not depend on the client: on a
+# machine shared with h2load, req/s can measure the client's limit instead of
+# the server's, and then only CPU per request compares servers fairly.
+bench_load_one() { # name method path body proto work port server_pid
+  local name=$1 method=$2 path=$3 body=$4 proto=$5 work=$6 port=$7 server=$8
+  local args=(-c "$BENCH_CLIENTS" -t "$BENCH_THREADS" -D "$BENCH_DURATION" --warm-up-time 1
+              --log-file "$work/$name.$proto.log")
+  [[ $proto == h1 ]] && args+=(--h1 -m 1) || args+=(-m 10)
+  [[ -n $body ]] && args+=(-d "$work/body.json" -H 'content-type: application/json')
+  [[ $method == GET ]] || [[ -n $body ]] || args+=(-H ":method: $method")
+  "$H2LOAD" "${args[@]}" "http://127.0.0.1:$port$path" >"$work/h2load.out" 2>&1 &
+  local client=$!
+  # Sample from just after the warm-up to a second before the end.
+  sleep 1.2
+  local s0 c0 t0 s1 c1 t1
+  s0=$(bench_ticks "$server") c0=$(bench_ticks "$client") t0=$(bench_now_ns)
+  sleep "$(awk -v d="$BENCH_DURATION" 'BEGIN { print (d > 2 ? d - 1 : 1) }')"
+  s1=$(bench_ticks "$server") c1=$(bench_ticks "$client") t1=$(bench_now_ns)
+  wait "$client" || { warn "$name/$proto: h2load failed"; cat "$work/h2load.out" >&2; return; }
+  local out; out=$(cat "$work/h2load.out")
+  local rps done ok
+  rps=$(sed -n 's/^finished in [^,]*, \([0-9.]*\) req\/s.*/\1/p' <<<"$out")
+  read -r done ok < <(sed -n 's/^requests: [0-9]* total, [0-9]* started, \([0-9]*\) done, \([0-9]*\) succeeded.*/\1 \2/p' <<<"$out")
+  # Latency percentiles from the per-request log (third column: microseconds).
+  local pct; pct=$(cut -f3 "$work/$name.$proto.log" | sort -n | awk '{a[NR]=$1} END {
+    if (NR == 0) { print "0 0"; exit }
+    p50 = a[int(NR * 0.50) + (NR * 0.50 > int(NR * 0.50))]; p99 = a[int(NR * 0.99) + (NR * 0.99 > int(NR * 0.99))]
+    printf "%.3f %.3f", p50 / 1000, p99 / 1000 }')
+  local p50 p99; read -r p50 p99 <<<"$pct"
+  printf '%s.%s\treq_per_s\t%s\thigher\n' "$name" "$proto" "${rps:-0}"
+  printf '%s.%s\tp50_ms\t%s\tlower\n' "$name" "$proto" "$p50"
+  printf '%s.%s\tp99_ms\t%s\tlower\n' "$name" "$proto" "$p99"
+  printf '%s.%s\tnon_2xx\t%s\tlower\n' "$name" "$proto" "$(( ${done:-0} - ${ok:-0} ))"
+  local hz; hz=$(getconf CLK_TCK)
+  local cpu busy
+  read -r cpu busy < <(awk -v s=$((s1 - s0)) -v c=$((c1 - c0)) -v ns=$((t1 - t0)) -v hz="$hz" -v r="${rps:-0}" \
+                           -v th="$BENCH_THREADS" 'BEGIN {
+    secs = ns / 1e9; cpu = 0; busy = 0
+    if (r > 0 && secs > 0) cpu = s / hz / (r * secs) * 1e6
+    if (secs > 0) busy = c / hz / secs / th * 100
+    printf "%.2f %.0f\n", cpu, busy }')
+  printf '%s.%s\tserver_us_per_req\t%s\tlower\n' "$name" "$proto" "$cpu"
+  if ((busy >= 90)); then
+    warn "$name/$proto: h2load's threads were ${busy}% busy, so req/s is the client's limit; compare server_us_per_req"
+  fi
+  rm -f "$work/$name.$proto.log"
+}
+
+bench_wait_up() { # port log name
+  local i; for i in $(seq 100); do curl -sf -o /dev/null "http://127.0.0.1:$1/plaintext" && return; sleep 0.1; done
+  cat "$2" >&2; die "$3 did not start"
+}
+
+# Every chosen scenario against one server -> rows; rows are prefixed with `label`.
+bench_scenarios() { # label port work protos server_pid [scenario...]
+  local label=$1 port=$2 work=$3 protos=$4 server=$5; shift 5
+  local sc name method path body proto
+  for sc in "${BENCH_SCENARIOS[@]}"; do
+    read -r name method path body <<<"$sc"
+    if (($# > 0)) && [[ " $* " != *" $name "* ]]; then continue; fi
+    for proto in $protos; do
+      say "load: ${label}$name over $proto (${BENCH_DURATION}s, $BENCH_CLIENTS connections)"
+      bench_load_one "${label}$name" "$method" "$path" "$body" "$proto" "$work" "$port" "$server"
+    done
+  done
+}
+
+bench_load() { # [scenario...] -> rows
+  command -v "$H2LOAD" >/dev/null || die "h2load not found; run ./dev setup (nghttp2-client) or set H2LOAD"
+  local work; work=$(mktemp -d)
+  bench_body >"$work/body.json"
+  local fairings=(); [[ -n $BENCH_REALISTIC ]] && fairings=(CROCKET_BENCH_LOGGER=1 CROCKET_BENCH_METRICS=1)
+  env CROCKET_PORT=$BENCH_PORT "${fairings[@]}" "$(tree release)/crocket_bench" >"$work/server.log" 2>&1 &
+  local pid=$! rpid='' hpid=''
+  # shellcheck disable=SC2064
+  trap "kill $pid \${rpid:-} \${hpid:-} 2>/dev/null || true; wait $pid \${rpid:-} \${hpid:-} 2>/dev/null || true; rm -rf '$work'; trap - RETURN" RETURN
+  bench_wait_up "$BENCH_PORT" "$work/server.log" crocket_bench
+  bench_scenarios "" "$BENCH_PORT" "$work" "h1 h2c" "$pid" "$@"
+  kill "$pid"; wait "$pid" 2>/dev/null || true  # its exit status is not the benchmark's
+  if [[ -n $BENCH_VS_ROCKET ]]; then
+    # Rocket 0.5 serves HTTP/2 only over TLS, so the comparison is HTTP/1.1.
+    ROCKET_PORT=$ROCKET_BENCH_PORT ROCKET_ADDRESS=127.0.0.1 ROCKET_LOG_LEVEL=off \
+      "$(tree release)/rocket/release/rocket-bench" >"$work/rocket.log" 2>&1 &
+    rpid=$!
+    bench_wait_up "$ROCKET_BENCH_PORT" "$work/rocket.log" rocket-bench
+    bench_scenarios "rocket:" "$ROCKET_BENCH_PORT" "$work" "h1" "$rpid" "$@"
+    kill "$rpid"; wait "$rpid" 2>/dev/null || true
+  fi
+  if [[ -n $BENCH_VS_H2O ]]; then
+    local chosen=() sc
+    for sc in "${H2O_SCENARIOS[@]}"; do
+      if (($# == 0)) || [[ " $* " == *" $sc "* ]]; then chosen+=("$sc"); fi
+    done
+    if ((${#chosen[@]} == 0)); then
+      warn "--vs-h2o: bench/h2o.cpp answers none of these scenarios (only ${H2O_SCENARIOS[*]})"
+      return
+    fi
+    CROCKET_PORT=$H2O_BENCH_PORT "$(tree release)/crocket_bench_h2o" >"$work/h2o.log" 2>&1 &
+    hpid=$!
+    bench_wait_up "$H2O_BENCH_PORT" "$work/h2o.log" crocket_bench_h2o
+    bench_scenarios "h2o:" "$H2O_BENCH_PORT" "$work" "h1 h2c" "$hpid" "${chosen[@]}"
+  fi
+}
+
+bench_build_rocket() {
+  command -v cargo >/dev/null || die "--vs-rocket needs cargo (a Rust toolchain: https://rustup.rs)"
+  say "building bench/rocket (Rocket 0.5, release)"
+  cargo build --release --quiet --manifest-path "$ROOT/bench/rocket/Cargo.toml" --target-dir "$(tree release)/rocket" ||
+    die "bench/rocket did not build"
+}
+
+bench_vs() { # rows prefix name -> a crocket/<name> table for every scenario both ran
+  awk -F'\t' -v p="$2" -v other="$3" '
+    { v[$1 FS $2] = $3 }
+    index($1, ":") == 0 && $2 == "req_per_s" { names[++n] = $1 }
+    END {
+      printf "  %-20s %13s %13s %7s   %-15s %-15s %-17s %9s\n", "", "crocket req/s", other " req/s", "ratio",
+             "p50 ms (c / " substr(other, 1, 1) ")", "p99 ms (c / " substr(other, 1, 1) ")",
+             "CPU us/req (c / " substr(other, 1, 1) ")", "c - " substr(other, 1, 1) " us"
+      for (i = 1; i <= n; i++) {
+        c = names[i]; r = p ":" names[i]
+        if (!((r FS "req_per_s") in v)) continue
+        cr = v[c FS "req_per_s"]; rr = v[r FS "req_per_s"]
+        cc = v[c FS "server_us_per_req"]; rc = v[r FS "server_us_per_req"]
+        printf "  %-20s %13.0f %13.0f %6.2fx   %5.2f / %-7.2f %5.2f / %-7.2f %6.2f / %-8.2f %+9.2f\n", names[i], cr, rr,
+               (rr > 0 ? cr / rr : 0), v[c FS "p50_ms"], v[r FS "p50_ms"], v[c FS "p99_ms"], v[r FS "p99_ms"], cc, rc, cc - rc
+      }
+    }' "$1"
+}
+
+bench_print() { # file
+  awk -F'\t' '{ printf "  %-22s %-14s %12s\n", $1, $2, $3 }' "$1"
+}
+
+bench_compare() { # baseline current -> table; returns 1 on a >10% regression
+  awk -F'\t' -v OFS='\t' '
+    NR == FNR { base[$1 FS $2] = $3; next }
+    {
+      key = $1 FS $2; b = base[key]; c = $3; mark = ""
+      if (b == "") { printf "  %-22s %-14s %12s %12s\n", $1, $2, "-", c; next }
+      if (b + 0 == 0) change = (c + 0 == 0) ? 0 : 100
+      else change = (c - b) / b * 100
+      worse = ($4 == "higher") ? -change : change
+      # Ignore tiny absolute differences in counts and sub-0.05 ms latencies.
+      if (worse > 10 && !(($2 == "non_2xx" || $2 == "allocs_per_op") && c - b < 1) && !($2 ~ /_ms$/ && c - b < 0.05)) { mark = "  WORSE"; bad = 1 }
+      else if (worse < -10) mark = "  better"
+      printf "  %-22s %-14s %12s %12s %+8.1f%%%s\n", $1, $2, b, c, change, mark
+    }
+    END { exit bad }' "$1" "$2"
+}
+
+cmd_bench() {
+  local save='' compare='' kinds=() scenarios=()
+  BENCH_VS_ROCKET='' BENCH_VS_H2O='' BENCH_REALISTIC=
+  BENCH_DURATION=10 BENCH_CLIENTS=64
+  BENCH_THREADS=$(( $(nproc) >= 16 ? 8 : $(nproc) >= 8 ? 4 : 2 ))
+  H2LOAD=${H2LOAD:-h2load}
+  while (($#)); do
+    case $1 in
+      --save) save=$2; shift 2 ;;
+      --compare) compare=$2; shift 2 ;;
+      --duration) BENCH_DURATION=$2; shift 2 ;;
+      --clients) BENCH_CLIENTS=$2; shift 2 ;;
+      --vs-rocket) BENCH_VS_ROCKET=1; shift ;;
+      --vs-h2o) BENCH_VS_H2O=1; shift ;;
+      --realistic) BENCH_REALISTIC=1; shift ;;
+      --threads) BENCH_THREADS=$2; shift 2 ;;
+      load|micro) kinds+=("$1"); shift ;;
+      -*) die "unknown option $1" ;;
+      *) scenarios+=("$1"); shift ;;
+    esac
+  done
+  ((${#kinds[@]})) || kinds=(load micro)
+  if [[ -n $compare && ! -f $ROOT/bench/results/$compare.tsv ]]; then die "no bench/results/$compare.tsv; make one with --save $compare"; fi
+  [[ -n $BENCH_VS_ROCKET && " ${kinds[*]} " != *" load "* ]] && die "--vs-rocket compares load runs; drop 'micro'"
+  [[ -n $BENCH_VS_H2O && " ${kinds[*]} " != *" load "* ]] && die "--vs-h2o compares load runs; drop 'micro'"
+  build release crocket_bench crocket_microbench ${BENCH_VS_H2O:+crocket_bench_h2o}
+  [[ -n $BENCH_VS_ROCKET ]] && bench_build_rocket
+  local out; out=$(mktemp)
+  local k; for k in "${kinds[@]}"; do
+    case $k in
+      micro) say "micro: in-process timings and allocations"; "$(tree release)/crocket_microbench" >>"$out" ;;
+      load) bench_load "${scenarios[@]}" >>"$out" ;;
+    esac
+  done
+  local rc=0
+  if [[ -n $BENCH_VS_ROCKET ]]; then
+    ok "crocket and Rocket 0.5, HTTP/1.1"
+    bench_vs "$out" rocket Rocket
+  fi
+  if [[ -n $BENCH_VS_H2O ]]; then
+    ok "crocket and h2o alone (the last column: CPU crocket adds per request)"
+    bench_vs "$out" h2o h2o
+  fi
+  if [[ -n $compare ]]; then
+    ok "compared with $compare (baseline, now, change)"
+    bench_compare "$ROOT/bench/results/$compare.tsv" "$out" || rc=1
+    ((rc == 0)) || warn "more than 10% worse on a line marked WORSE"
+  else
+    ok "results"
+    bench_print "$out"
+  fi
+  if [[ -n $save ]]; then
+    mkdir -p "$ROOT/bench/results"
+    cp "$out" "$ROOT/bench/results/$save.tsv"
+    ok "saved as bench/results/$save.tsv"
+  fi
+  rm -f "$out"
+  return "$rc"
+}
+
+# ---- fuzz ------------------------------------------------------------------------
+
+# Builds tests/fuzz with AddressSanitizer and coverage (build-fuzz/) and runs
+# targets for longer than ctest does. Crashes land in build-fuzz/crashes/.
+cmd_fuzz() {
+  local seconds=60 args=() target=all replay=()
+  while (($#)); do
+    case $1 in
+      --seconds) seconds=$2; shift 2 ;;
+      --save) args+=(--save); shift ;;
+      --seed) args+=(--seed "$2"); shift 2 ;;
+      --replay) shift; replay=("$@"); break ;;
+      -*) die "unknown option $1" ;;
+      *) target=$1; shift ;;
+    esac
+  done
+  build fuzz crocket_fuzz
+  local exe; exe="$(tree fuzz)/tests/crocket_fuzz"
+  local crashes; crashes="$(tree fuzz)/crashes"
+  mkdir -p "$crashes"
+  if ((${#replay[@]})); then
+    local f files=(); for f in "${replay[@]}"; do files+=("$(realpath "$f")"); done
+    (cd "$crashes" && "$exe" "$target" --replay "${files[@]}")
+    return
+  fi
+  say "fuzzing ${target} (${seconds}s per target, AddressSanitizer, coverage)"
+  if (cd "$crashes" && ASAN_OPTIONS=${ASAN_OPTIONS:-abort_on_error=1} "$exe" "$target" --seconds "$seconds" "${args[@]}"); then
+    ok "no crashes"
+  else
+    die "found a problem; the input is in ${crashes#"$ROOT"/}/ (replay: ./dev fuzz <target> --replay FILE)"
+  fi
+}
+
+# ---- h2o -------------------------------------------------------------------------
+
+H2O_REPO=h2o/h2o
+H2O_PIN=$ROOT/cmake/h2o.cmake
+
+# Moves the h2o pin in cmake/h2o.cmake to <ref> (default: master), then runs the
+# release build and the full test suite. h2o has no recent release tags, so the
+# pin is a commit plus the SHA-256 of its GitHub tarball.
+cmd_h2o_update() {
+  local ref=${1:-master}
+  for t in curl sha256sum sed; do command -v "$t" >/dev/null || die "missing $t"; done
+  local old; old=$(sed -n 's/^set(CROCKET_H2O_COMMIT \([0-9a-f]*\)).*/\1/p' "$H2O_PIN")
+  [[ -n $old ]] || die "no CROCKET_H2O_COMMIT in ${H2O_PIN#"$ROOT"/}"
+
+  say "resolving h2o '$ref'"
+  local json sha date
+  json=$(curl -fsSL -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$H2O_REPO/commits/$ref") ||
+    die "GitHub has no h2o commit, branch or tag named '$ref'"
+  sha=$(sed -n 's/^  "sha": "\([0-9a-f]\{40\}\)",$/\1/p' <<<"$json" | head -1)
+  date=$(sed -n 's/^ *"date": "\([0-9-]\{10\}\)T.*/\1/p' <<<"$json" | tail -1)  # committer date
+  [[ -n $sha ]] || die "could not read the commit id from GitHub's answer"
+  if [[ $sha == "$old" ]]; then ok "h2o is already pinned to $sha ($ref)"; return; fi
+
+  say "downloading h2o $sha ($date)"
+  local tmp; tmp=$(mktemp)
+  curl -fsSL -o "$tmp" "https://github.com/$H2O_REPO/archive/$sha.tar.gz" || { rm -f "$tmp"; die "download failed"; }
+  local sum; sum=$(sha256sum "$tmp" | cut -d' ' -f1)
+  rm -f "$tmp"
+
+  sed -i -e "s/^set(CROCKET_H2O_COMMIT [0-9a-f]*).*/set(CROCKET_H2O_COMMIT $sha)  # $date/" \
+         -e "s/^set(CROCKET_H2O_SHA256 [0-9a-f]*)/set(CROCKET_H2O_SHA256 $sum)/" "$H2O_PIN"
+  ok "pinned h2o $sha ($date) in ${H2O_PIN#"$ROOT"/}"
+  say "upstream changes: https://github.com/$H2O_REPO/compare/$old...$sha"
+  say "release build and full test suite"
+  cmd_check || die "h2o $sha fails ./dev check; the new pin is left in place to investigate (git checkout ${H2O_PIN#"$ROOT"/} reverts it)"
+  ok "h2o $sha passes ./dev check; commit ${H2O_PIN#"$ROOT"/} to keep it"
 }
 
 # ---- watch -------------------------------------------------------------------
@@ -228,7 +582,8 @@ cmd_watch() {
 cmd=${1:-help}
 shift || true
 case $cmd in
-  setup|gcc|build|run|watch|test|check|clean) "cmd_$cmd" "$@" ;;
+  setup|gcc|build|run|watch|test|check|clean|bench|fuzz) "cmd_$cmd" "$@" ;;
+  h2o-update) cmd_h2o_update "$@" ;;
   help|-h|--help) usage ;;
   *) usage >&2; exit 1 ;;
 esac

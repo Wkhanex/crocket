@@ -4,9 +4,9 @@
 # It runs in the toolchain image, so GCC 16.2's libstdc++ is there at run time.
 FROM ghcr.io/sean3z/crocket-toolchain:gcc-16.2
 COPY . /src
-RUN cmake --preset release -DCMAKE_C_COMPILER=/opt/gcc-16.2/bin/gcc-16 \
-      -DCMAKE_CXX_COMPILER=/opt/gcc-16.2/bin/g++-16 \
-      -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath,/opt/gcc-16.2/lib64" \
+RUN cmake --preset release -DCMAKE_C_COMPILER=/opt/gcc-16.2/bin/gcc-16.2 \
+      -DCMAKE_CXX_COMPILER=/opt/gcc-16.2/bin/g++-16.2 \
+      -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath,$(dirname $(/opt/gcc-16.2/bin/g++-16.2 -print-file-name=libstdc++.so))" \
  && cmake --build build --target crocket_hello \
  && install -m755 "$(find build -type f -name crocket_hello -perm -u+x | head -1)" /usr/local/bin/ \
  && rm -rf /src/build

@@ -1,5 +1,7 @@
 # crocket
 
+[![CI](https://github.com/sean3z/crocket/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/sean3z/crocket/actions/workflows/ci.yml)
+
 A C++ web framework in the same spirit as [Rocket](https://rocket.rs) for Rust. Not a port.
 
 Handlers are functions. Path captures and extractors are arguments. The return value is the response. Routes are declared with C++26 annotations and discovered with reflection. The wire layer is [h2o](https://github.com/h2o/h2o) (HTTP/1.1, HTTP/2, TLS).

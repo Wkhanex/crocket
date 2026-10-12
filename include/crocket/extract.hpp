@@ -18,6 +18,7 @@
 #include "crocket/state.hpp"
 
 #include <charconv>
+#include <cmath>
 #include <concepts>
 #include <expected>
 #include <functional>
@@ -74,6 +75,7 @@ struct FromParam<T> {
     T v{};
     auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
     if (s.empty() || ec != std::errc() || p != s.data() + s.size()) return std::nullopt;
+    if (!std::isfinite(v)) return std::nullopt;  // from_chars takes "nan" and "inf"; a path or query value may not
     return v;
   }
 };

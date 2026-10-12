@@ -42,6 +42,10 @@ struct Config {
   /// 503 server.busy. With max_body_bytes, it bounds what bodies can take
   /// however many clients send them.
   std::size_t max_body_memory = std::size_t(256) << 20;
+  /// A 200 to GET or HEAD without an ETag gets one, a hash of the body, when
+  /// the body is at most this long (hashing costs about a microsecond per 10
+  /// KiB). 0: never. Set an ETag yourself for larger bodies.
+  std::size_t etag_max_bytes = std::size_t(1) << 20;
   std::chrono::milliseconds request_timeout{30'000};  // 504 deadline.exceeded
   std::chrono::milliseconds drain_timeout{10'000};    // graceful shutdown budget
   bool debug_routes = false;                          // expose GET /__routes
@@ -446,6 +450,11 @@ class LocalClient {
     /// Handles the request, then waits until its log lines are written, so a
     /// test can read them.
     Response dispatch() {
+      if (req_.path.empty()) {  // a NUL in the path: the engine's 400
+        auto res = app_.reject(req_, {400, "http.invalid", "invalid request path", {}});
+        app_.flush_logs();
+        return res;
+      }
       auto res = app_.handle(std::move(req_));
       app_.flush_logs();
       return res;
@@ -475,6 +484,13 @@ class LocalClient {
 
 namespace detail {
 std::string percent_decode(std::string_view s, bool plus_is_space);
+/// The path a request is routed on, from the target's path (before any '?'):
+/// split on '/', each segment percent-decoded, "." and ".." segments removed
+/// (RFC 3986 5.2.4), and a '%' or '/' inside a segment written %25 or %2F, so
+/// the result splits into exactly those segments ("/files/a%2Fb" stays two).
+/// nullopt when a segment decodes to a NUL. The engine and LocalClient both
+/// use it, so in-process tests route as production does.
+std::optional<std::string> normalize_path(std::string_view raw);
 std::vector<std::pair<std::string, std::string>> parse_query(std::string_view q);
 std::string generate_request_id();
 /// On a worker thread: the deadline of the request it now runs (for

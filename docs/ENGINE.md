@@ -37,7 +37,7 @@ stays in place so you can investigate; `git checkout cmake/h2o.cmake` reverts it
 What to look at in the upstream compare, because the engine relies on it:
 
 - `h2o_req_t` fields: `entity`, `proceed_req`, `write_req`, `content_length`,
-  `path_normalized`, `res.trailers`, `http1_is_persistent`.
+  `path`, `query_at`, `res.trailers`, `http1_is_persistent`.
 - The streaming request-body contract in `include/h2o.h`
   (`h2o_handler_t::supports_request_streaming`).
 - `h2o_httpclient_error_is_eos`, which the engine passes to `proceed_req` to end a
@@ -134,9 +134,12 @@ session is freed.
 
 Request construction:
 
-- **Path and query:** h2o has removed dot segments and percent-decoded the path
-  (`path_normalized`). The query string is split and decoded by `detail::parse_query`.
-  A path that decodes to a NUL byte is 400 `http.invalid`.
+- **Path and query:** from the raw target (`req->path`), not h2o's `path_normalized`,
+  which decodes `%2F` into a `/` before splitting. `detail::normalize_path` splits on `/`,
+  decodes each segment, removes dot segments, and keeps a `%` or `/` inside a segment as
+  `%25` or `%2F`, so the router splits it into the same segments; captures holding one are
+  decoded when bound. `LocalClient` uses the same function. The query string is split and
+  decoded by `detail::parse_query`. A path that decodes to a NUL byte is 400 `http.invalid`.
 - **Headers:** every request header reaches the handler over both protocols, custom ones
   included. Over h2 the `host` header is filled from `:authority`.
 - **`protocol`:** `"h2"` for HTTP/2 requests, otherwise `"http/1.1"`.

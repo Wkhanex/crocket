@@ -363,10 +363,12 @@ Request Loop::build_request(h2o_req_t* req, std::size_t& header_bytes, std::size
   rq.method_text = std::string(view(req->method));
   rq.method = http::parse_method(rq.method_text);
 
-  // h2o has already removed dot segments and percent-decoded the path.
-  auto path = view(req->path_normalized);
-  rq.path = path.empty() ? std::string("/") : std::string(path);
-  if (req->query_at != SIZE_MAX) rq.query = parse_query(view(req->path).substr(req->query_at + 1));
+  // From the raw target, not h2o's path_normalized: that decodes %2F into a
+  // '/' before splitting, so "/files/a%2Fb" would route as three segments.
+  auto raw = view(req->path);
+  auto query_at = raw.find('?');
+  rq.path = normalize_path(raw.substr(0, query_at)).value_or(std::string());  // "": a NUL, rejected below
+  if (query_at != std::string_view::npos) rq.query = parse_query(raw.substr(query_at + 1));
 
   header_bytes = req->method.len + req->path.len;
   header_count = req->headers.size;
@@ -418,7 +420,7 @@ int Loop::on_req(h2o_req_t* req) {
     reject(s, {431, "headers.too_large", "request headers too large", {}});
     return 0;
   }
-  if (req->path_normalized_has_null_char) {
+  if (s->meta.path.empty()) {
     reject(s, {400, "http.invalid", "invalid request path", {}});
     return 0;
   }

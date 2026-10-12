@@ -610,7 +610,7 @@ void Crocket::finish(const Request& req, Response& res) {
                 req, res);
   }
   res.headers.set("x-request-id", req.request_id);
-  detail::conditional(req, res);
+  detail::conditional(req, res, core_->config.etag_max_bytes);
   auto& fs = core_->fairings;
   for (auto it = fs.rbegin(); it != fs.rend(); ++it) {
     try {
@@ -642,6 +642,17 @@ bool Crocket::run_routes(Request& req, Response& res) {
     req.route = &def;
     req.handler = def.handler;
     req.captures = candidates.captures(*cand);
+    // A segment keeps '/' and '%' escaped (normalize_path); the handler gets the text.
+    if (req.decoded_captures) req.decoded_captures->clear();
+    for (std::size_t i = 0; i < req.captures.size(); ++i) {
+      if (req.captures[i].find('%') == std::string_view::npos) continue;
+      if (!req.decoded_captures) {
+        req.decoded_captures = std::make_shared<std::vector<std::string>>();
+        req.decoded_captures->reserve(Captures::capacity);  // never reallocates under the views
+      }
+      req.decoded_captures->push_back(detail::percent_decode(req.captures[i], false));
+      req.captures.set(i, req.decoded_captures->back());
+    }
     if (def.builtin != detail::Builtin::None) {
       res = builtin(def.builtin, req);
       return false;
@@ -829,7 +840,7 @@ LocalClient::Call::Call(Crocket& app, http::Method m, std::string_view target) :
   req_.method = m;
   req_.method_text = http::method_name(m);
   auto q = target.find('?');
-  req_.path = detail::percent_decode(target.substr(0, q), false);
+  req_.path = detail::normalize_path(target.substr(0, q)).value_or(std::string());  // "": 400, as the engine
   if (q != std::string_view::npos) req_.query = detail::parse_query(target.substr(q + 1));
   req_.received = Clock::now();
 }

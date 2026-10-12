@@ -76,6 +76,9 @@ auto hello(std::string_view name, std::uint8_t age) -> std::string {
   return std::format("Hello, {} year old named {}!", age, name);
 }
 
+[[= http::get("/scale/{f}")]]
+auto scale(double f) -> std::string { return std::format("{}", f * 2); }
+
 [[= http::post("/users")]]
 auto create(Json<NewUser> body, Auth auth, State<Db> db) -> Result<Created<User>, ApiError> {
   ++g_create_calls;
@@ -841,6 +844,72 @@ int main() {
     broken.attach(Shield{}.set("x-bad", "a\r\nset-cookie: x"));
     auto ig = broken.ignite();
     CHECK(!ig && contains(ig.error().message(), "Shield: header 'x-bad'"));
+  }
+
+  section("paths: segments, dot segments, %2F and NUL, as the engine routes them");
+  {
+    auto name = [&](std::string_view target) {
+      auto r = client.get(target).dispatch();
+      return r.status == 200 ? r.body : std::to_string(r.status);
+    };
+    // %2F inside a capture is data: two segments, not three.
+    CHECK_EQ(name("/hello/a%2Fb/36"), std::string("Hello, 36 year old named a/b!"));
+    CHECK_EQ(name("/hello/..%2Fsecret/36"), std::string("Hello, 36 year old named ../secret!"));
+    CHECK_EQ(name("/hello/100%25/36"), std::string("Hello, 36 year old named 100%!"));
+    CHECK_EQ(name("/hello/a%2Fb%2Fc/36"), std::string("Hello, 36 year old named a/b/c!"));
+    // Dot segments are removed, encoded or not, and never climb above the root.
+    CHECK_EQ(name("/hello/Ada/../Bob/36"), std::string("Hello, 36 year old named Bob!"));
+    CHECK_EQ(name("/x/%2e%2E/hello/Ada/36"), std::string("Hello, 36 year old named Ada!"));
+    CHECK_EQ(name("/../../hello/./Ada/36"), std::string("Hello, 36 year old named Ada!"));
+    CHECK_EQ(name("/hello/a%00b/36"), std::string("400"));
+    CHECK_EQ(name("/hello/a%2Fb/../36"), std::string("404"));  // ".." takes off the "a%2Fb" segment
+    // The pieces themselves.
+    CHECK_EQ(*detail::normalize_path("/a/b%2Fc/%25"), std::string("/a/b%2Fc/%25"));
+    CHECK_EQ(*detail::normalize_path("/a/./b/.."), std::string("/a/"));
+    CHECK_EQ(*detail::normalize_path(""), std::string("/"));
+    CHECK_EQ(*detail::normalize_path("/plain/path"), std::string("/plain/path"));
+    CHECK(!detail::normalize_path("/a%00"));
+    std::vector<http::Segment> segs;
+    CHECK(contains(http::parse_template("/files/a%2Fb", segs), "'%'"));
+    CHECK(contains(http::parse_template("/files/../x", segs), "dot segment"));
+  }
+
+  section("path values: floats are finite");
+  {
+    CHECK_EQ(client.get("/scale/1.5").dispatch().body, std::string("3"));
+    for (auto bad : {"/scale/nan", "/scale/inf", "/scale/-infinity", "/scale/NaN"})
+      CHECK_EQ(client.get(bad).dispatch().status, 404);  // not a match for {f}, as "/scale/abc"
+  }
+
+  section("problem titles: every status has one");
+  {
+    for (int status : {400, 401, 403, 404, 405, 406, 408, 409, 410, 412, 413, 415, 416, 422, 429, 431, 500, 501, 502,
+                       503, 504, 206, 307, 308})
+      CHECK(!detail::reason_phrase(status).empty());
+    CHECK_EQ(detail::reason_phrase(416), std::string_view("Range Not Satisfiable"));
+    CHECK_EQ(detail::reason_phrase(431), std::string_view("Request Header Fields Too Large"));
+    CHECK_EQ(detail::reason_phrase(499), std::string_view("Client Error"));  // unlisted: its class
+    auto r = client.get("/hello/a/36").header("range", "bytes=0-1").dispatch();  // no ranges here: plain 200
+    CHECK_EQ(r.status, 200);
+  }
+
+  section("ETags: only for bodies up to etag_max_bytes");
+  {
+    LogCapture quiet;
+    Config small{.debug_routes = true};
+    small.etag_max_bytes = 16;
+    Crocket capped = make_app(quiet, nullptr, small);
+    LocalClient cc(capped);
+    auto big = cc.get("/hello/Ada/36").dispatch();  // 29 bytes
+    CHECK(big.status == 200 && !big.headers.contains("etag"));
+    CHECK_EQ(cc.get("/hello/Ada/36").header("if-none-match", "\"x\"").dispatch().status, 200);
+    auto small_body = cc.get("/scale/1").dispatch();  // "2"
+    CHECK(small_body.headers.contains("etag"));
+    Config off{.debug_routes = true};
+    off.etag_max_bytes = 0;
+    Crocket none = make_app(quiet, nullptr, off);
+    LocalClient nc(none);
+    CHECK(!nc.get("/scale/1").dispatch().headers.contains("etag"));
   }
 
   section("conditional requests: ETag and Last-Modified");
